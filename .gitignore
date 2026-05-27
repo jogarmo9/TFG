@@ -1,0 +1,25 @@
+# Data and large files
+data/aumento/
+audios/
+outputs/
+scratch/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Notebooks
+.ipynb_checkpoints
+
+# Documentation and plans
+plan_*.md
+scripts/
+
+# OS
+.DS_Store
+Thumbs.db
