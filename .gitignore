@@ -1,6 +1,4 @@
 # Data and large files
-data/aumento/
-audios/
 outputs/
 scratch/
 
@@ -16,10 +14,11 @@ ENV/
 # Notebooks
 .ipynb_checkpoints
 
-# Documentation and plans
-plan_*.md
-scripts/
 
 # OS
 .DS_Store
 Thumbs.db
+
+data/
+.venv/
+.venv311/
