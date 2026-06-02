@@ -1,4 +1,5 @@
 import argparse
+import warnings
 import numpy as np
 from scipy.io import wavfile
 from scipy.interpolate import CubicSpline
@@ -132,10 +133,12 @@ def clean_audio_dfn3(path_in: str, path_out: str, atten_lim_db: float = 75.0,
     audio, _ = load_audio(path_in, sr=df_state.sr())
     if torch.cuda.is_available():
         audio = audio.to("cuda")
-    enhanced = enhance(model, df_state, audio, atten_lim_db=atten_lim_db)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*sinc_interpolation.*", category=UserWarning)
+        enhanced = enhance(model, df_state, audio, atten_lim_db=atten_lim_db)
     arr = enhanced.squeeze().cpu().numpy() if hasattr(enhanced, "numpy") else np.array(enhanced.cpu()).squeeze()
     if df_state.sr() != 16_000:
-        arr = librosa.resample(arr, orig_sr=df_state.sr(), target_sr=16_000, res_type='sinc_interp_hann')
+        arr = librosa.resample(arr, orig_sr=df_state.sr(), target_sr=16_000, res_type='kaiser_best')
     sf.write(path_out, arr, 16_000, subtype="PCM_16")
 
 
@@ -281,6 +284,10 @@ if __name__ == "__main__":
     parser.add_argument("--impulse-passes", type=int, default=2)
     parser.add_argument("--atten-lim-db", type=float, default=75.0,
                         help="DFN3: máximo dB de supresión (default: 75.0)")
+    parser.add_argument("--date-from", default=None,
+                        help="Procesar solo archivos desde esta fecha (formato YYYYMMDD, inclusive)")
+    parser.add_argument("--date-to", default=None,
+                        help="Procesar solo archivos hasta esta fecha (formato YYYYMMDD, inclusive)")
     parser.add_argument("--reprocess-all", action="store_true",
                         help="Reprocesa todos los archivos aunque ya existan en clean-dir")
     parser.add_argument("--audios-dir", default=str(_ROOT / "data" / "audios"),
@@ -316,10 +323,23 @@ if __name__ == "__main__":
         if args.method == "dfn3":
             dfn3_model, dfn3_state = _load_dfn3_model()
 
+        date_from = args.date_from  # e.g. "20260311"
+        date_to   = args.date_to    # e.g. "20260424"
+
         for f in wavs:
 
             filename = f.name
             out_path = clean_dir / filename
+
+            # Filter by date embedded in filename (YYYYMMDD_...)
+            file_date = filename[:8]
+            if file_date.isdigit():
+                if date_from and file_date < date_from:
+                    skipped += 1
+                    continue
+                if date_to and file_date > date_to:
+                    skipped += 1
+                    continue
 
             if not args.reprocess_all and out_path.exists():
                 print(f"[SKIP] {filename} (ya limpio)")

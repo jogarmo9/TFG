@@ -37,6 +37,14 @@ OUTPUT_CSV_RAW  = _ROOT / "data" / "processed" / "predicciones_clean_raw.csv"
 SPEECH_ID   = 4
 ALL_CLASSES = set(range(9))
 
+# ── HPSS armónico (pass 1, Wiener) ───────────────────────────────────────────
+# Elimina componente percusiva (crispeos/impulsos) antes de YOLO.
+# Reduce FP de Ring Tone(5) y Vibrating(6). Horn/Siren son tonales → sobreviven.
+# Validado en NB-07: k=61 < k=31 en FP Vibrating.
+# Pass 2 (DFN3/Speech) NO usa HPSS — Speech pendiente de validación separada.
+WIENER_HPSS        = True   # False = desactivar
+WIENER_HPSS_KERNEL = 61
+
 SR          = 16_000        # model sample rate
 CHUNK_SEC   = 10            # seconds per inference window
 CHUNK_SAMP  = SR * CHUNK_SEC
@@ -189,7 +197,7 @@ def infer_chunk(session, chunk: np.ndarray, conf_thresh: float) -> list:
 # PROCESS ONE FILE
 # ──────────────────────────────────────────────────────────────
 def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_start: datetime,
-                 source_file: str, session_id: str, class_filter=None):
+                 source_file: str, session_id: str, class_filter=None, hpss_kernel: int = 0):
     """
     Chunks the audio, runs inference, and writes rows to both CSV writers.
     class_filter: set of class_ids to keep, or None for all classes.
@@ -204,6 +212,12 @@ def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_
 
         if len(chunk) < CHUNK_SAMP:
             chunk = np.pad(chunk, (0, CHUNK_SAMP - len(chunk)))
+
+        if hpss_kernel > 0:
+            D_full = lb.stft(chunk, n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH)
+            D_harm, _ = lb.decompose.hpss(D_full, kernel_size=hpss_kernel)
+            chunk = lb.istft(D_harm, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
+                             length=CHUNK_SAMP)
 
         chunk_offset = timedelta(seconds=i * CHUNK_SEC)
         raw_boxes    = infer_chunk(session, chunk, CONF_THRESH)
@@ -230,7 +244,8 @@ def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_
 # MAIN
 # ──────────────────────────────────────────────────────────────
 def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
-             class_filter=None, already_done: set = None) -> tuple[int, int]:
+             class_filter=None, already_done: set = None,
+             hpss_kernel: int = 0) -> tuple[int, int]:
     """Procesa todos los WAVs en wav_dir, escribe a ambos writers. Retorna (ok, fail)."""
     wav_files = sorted(wav_dir.glob("*.wav"))
     if not wav_files:
@@ -253,7 +268,7 @@ def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
             session_id = f"{file_start.year}{file_start.month:02d}{file_start.day:02d}"
             process_file(infer_session, wav_path, writer, raw_writer,
                          mic_id, file_start, filename, session_id,
-                         class_filter=class_filter)
+                         class_filter=class_filter, hpss_kernel=hpss_kernel)
             label = "" if class_filter is None else f" (clases {sorted(class_filter)})"
             print(f"  [OK] {filename}{label}")
             ok += 1
@@ -305,9 +320,12 @@ def main():
             writer.writerow(header)
             raw_writer.writerow(header)
 
-            print(f"\n[PASS 1] Wiener ({CLEAN_DIR.name}/) → todas las clases excepto Speech")
+            hpss_k1 = WIENER_HPSS_KERNEL if WIENER_HPSS else 0
+            hpss_note = f" + HPSS-harm k={hpss_k1}" if hpss_k1 else ""
+            print(f"\n[PASS 1] Wiener ({CLEAN_DIR.name}/) → clases≠Speech{hpss_note}")
             ok1, fail1 = _run_dir(infer_session, CLEAN_DIR, writer, raw_writer,
-                                  class_filter=ALL_CLASSES - {SPEECH_ID})
+                                  class_filter=ALL_CLASSES - {SPEECH_ID},
+                                  hpss_kernel=hpss_k1)
 
             print(f"\n[PASS 2] DFN3 ({CLEAN_DFN_DIR.name}/) → Speech únicamente")
             ok2, fail2 = _run_dir(infer_session, CLEAN_DFN_DIR, writer, raw_writer,

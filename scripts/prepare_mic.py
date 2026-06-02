@@ -31,7 +31,10 @@ RAW_DIR       = ROOT / "data" / "raw"
 CLEAN_CSV     = PROCESSED_DIR / "predicciones_clean.csv"
 CLEAN_CSV_RAW = PROCESSED_DIR / "predicciones_clean_raw.csv"
 
-TIME_CORRECTIONS = {"23-03-2026": -1}   # día -> delta en horas
+TIME_CORRECTIONS = {
+    "23-03-2026": -1,  # reloj grabadora 1h adelantado respecto a GPS
+    "11-03-2026": -1,  # mismo desfase; recupera sesion tarde (GPS2 19:22-19:38 UTC)
+}
 
 THRESHOLD_MIC = 4    # segundos: margen join GPS ↔ predicción mic
 THRESHOLD_MOB = 10   # segundos: margen join GPS ↔ predicción móvil
@@ -46,7 +49,7 @@ ROUTE_NAMES:   dict[str, tuple[str, str]] = {
 # Fechas que tienen GPX pero se excluyen del contador de rutas (fallo GPS u otra razón).
 # Sus trackpoints se guardan en tracks_mic con nombre "<fecha>_skip" para no perder el GPS.
 SKIP_DATES: set[str] = {
-    "11-03-2026",  # fallo de sincronía GPS — predictions fuera del rango del track
+    # "11-03-2026" resuelto con TIME_CORRECTIONS -1h; sesion tarde alineada con GPS2
 }
 
 # ── Parámetros NMS cruzado M1/M2 ─────────────────────────────────────────────
@@ -312,6 +315,8 @@ def run_join():
         pred_mob["duration_s"] = (pred_mob["t_end"] - pred_mob["t_start"]).dt.total_seconds()
         pred_mob["class"]      = pred_mob["class"].astype(int)
         pred_mob["date"]       = pred_mob["t_start"].dt.tz_convert("Europe/Madrid").dt.strftime("%d-%m-%Y")
+        if "session_id" not in pred_mic.columns:
+            pred_mic = pred_mic.assign(session_id=None)
         pred_combined = pd.concat([pred_mic, pred_mob], ignore_index=True)
         print(f"  Predicciones: {len(pred_mic)} mic + {len(pred_mob)} móvil = {len(pred_combined)} total")
     else:
@@ -343,7 +348,7 @@ def run_join():
     n_total = len(pred_combined)
 
     gps_ref = (
-        tracks_all[["date", "time", "lat", "lon", "trayecto"]]
+        tracks_all[["date", "time", "lat", "lon", "trayecto", "source"]]
         .rename(columns={"time": "gps_time"})
         .sort_values("gps_time")
     )
@@ -353,8 +358,9 @@ def run_join():
         sub = pred_combined[pred_combined["source"] == src].sort_values("t_mid").copy()
         if sub.empty:
             continue
+        gps_src = gps_ref[gps_ref["source"] == src].drop(columns=["source"])
         merged = pd.merge_asof(
-            sub, gps_ref,
+            sub, gps_src,
             left_on="t_mid", right_on="gps_time",
             by="date",
             tolerance=pd.Timedelta(seconds=thr),
@@ -380,7 +386,9 @@ def run_join():
     else:
         print("  Todos los eventos tienen GPS asignado.")
 
-    pred_geo = pred_joined.dropna(subset=["lat", "lon"])
+    pred_geo = pred_joined.dropna(subset=["lat", "lon"]).copy()
+    if "session_id" in pred_geo.columns:
+        pred_geo["session_id"] = pred_geo["session_id"].astype(pd.StringDtype())
     pred_geo.to_parquet(PROCESSED_DIR / "predictions_geo.parquet", index=False)
 
     n_mic = (pred_geo["source"] == "mic").sum()

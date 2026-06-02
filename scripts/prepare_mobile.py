@@ -140,7 +140,7 @@ def convert_to_wav(audio_path: Path, out_path: Path):
         if decoded.nchannels == 2:
             audio = audio.reshape(-1, 2).mean(axis=1)
         if decoded.sample_rate != 16_000:
-            audio = librosa.resample(audio, orig_sr=decoded.sample_rate, target_sr=16_000, res_type='sinc_interp_hann')
+            audio = librosa.resample(audio, orig_sr=decoded.sample_rate, target_sr=16_000, res_type='kaiser_best')
         sf.write(str(out_path), audio, 16_000, subtype="PCM_16")
         return
 
@@ -346,7 +346,7 @@ def infer_wav_direct(wav_path: Path, audio_start: datetime, mic_id: int,
     n_chunks = max(1, int(np.ceil(len(audio) / CHUNK_SAMP)))
     inner = YOLO_W - 2 * PAD_COLS
 
-    rows = []
+    pre_nms = []  # [t1_s, t2_s, cls_id, conf] — segundos absolutos desde audio_start
     raw_rows = []
     for i in range(n_chunks):
         chunk = audio[i * CHUNK_SAMP:(i + 1) * CHUNK_SAMP]
@@ -364,35 +364,33 @@ def infer_wav_direct(wav_path: Path, audio_start: datetime, mic_id: int,
         x2 = np.clip((xc + w / 2 - PAD_COLS) * CHUNK_SEC / inner, 0, CHUNK_SEC)
         boxes = [[float(x1[j]), float(x2[j]), int(cls[j]), float(probs[j])]
                  for j in range(len(probs)) if probs[j] >= CONF_THRESH and x2[j] > x1[j]]
-        chunk_offset = timedelta(seconds=i * CHUNK_SEC)
+        chunk_offset_s = i * CHUNK_SEC
 
         for bx1, bx2, cls_id, conf in boxes:
             if class_filter is not None and cls_id not in class_filter:
                 continue
-            onset = audio_start + chunk_offset + timedelta(seconds=bx1)
-            offset = audio_start + chunk_offset + timedelta(seconds=bx2)
+            t1_s = chunk_offset_s + bx1
+            t2_s = chunk_offset_s + bx2
+            pre_nms.append([t1_s, t2_s, cls_id, conf])
             raw_rows.append({
                 "mic_id": mic_id,
-                "timestamp_onset": onset.isoformat(),
-                "timestamp_offset": offset.isoformat(),
+                "timestamp_onset": (audio_start + timedelta(seconds=t1_s)).isoformat(),
+                "timestamp_offset": (audio_start + timedelta(seconds=t2_s)).isoformat(),
                 "class_id": float(cls_id),
                 "confidence": conf,
                 "source_file": wav_path.name,
             })
 
-        for bx1, bx2, cls_id, conf in nms(boxes):
-            if class_filter is not None and cls_id not in class_filter:
-                continue
-            onset = audio_start + chunk_offset + timedelta(seconds=bx1)
-            offset = audio_start + chunk_offset + timedelta(seconds=bx2)
-            rows.append({
-                "mic_id": mic_id,
-                "timestamp_onset": onset.isoformat(),
-                "timestamp_offset": offset.isoformat(),
-                "class_id": float(cls_id),
-                "confidence": conf,
-                "source_file": wav_path.name,
-            })
+    rows = []
+    for bx1, bx2, cls_id, conf in nms(pre_nms):
+        rows.append({
+            "mic_id": mic_id,
+            "timestamp_onset": (audio_start + timedelta(seconds=bx1)).isoformat(),
+            "timestamp_offset": (audio_start + timedelta(seconds=bx2)).isoformat(),
+            "class_id": float(cls_id),
+            "confidence": conf,
+            "source_file": wav_path.name,
+        })
 
     print(f"  [OK] {wav_path.name}: {len(rows)} detecciones ({len(raw_rows)} raw)")
     return rows, raw_rows

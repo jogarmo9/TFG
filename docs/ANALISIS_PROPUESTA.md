@@ -13,6 +13,7 @@ implementación actual; es punto de partida para los notebooks de análisis.
 - **GPS:** lat/lon interpolado por timestamp sobre el track.
 - **Fuentes:**
   - **mic** = conductor *solo*, 2 micrófonos fijos (M1+M2), nr=0.85, ruta fija PAIPORTA-ETSE, marzo–abril.
+    - Los eventos comunes a M1+M2 se fusionan en el ETL (NMS cruzado, IoU temporal **0.3** + ±1 s) → 1 detección/evento. *(El IoU **0.7** es el NMS intra-fuente, no el cruzado.)*
   - **mobile** = conductor *acompañado*, 1 mic smartphone, nr=0.50, rutas variadas, mayo.
 - **6 pasadas ALDAIA-PAIPORTA**: mismas condiciones aproximadas (solo varió ligeramente la hora) → **réplica pura**.
 
@@ -32,6 +33,12 @@ mic y mobile difieren en nº de micrófonos, fuerza de filtrado (nr), rutas, fec
 - mic vs mobile se reporta como **descriptivo**, con el confound declarado explícitamente. No se vende como causal.
 - Las **6 pasadas** (mismo sensor, mismas condiciones) son el activo más limpio → base de fiabilidad.
 
+**Confound de recall (2 mics vs 1):** mic graba con 2 micrófonos (M1+M2), mobile con 1. El ETL
+deduplica los eventos captados por ambos mics (NMS cruzado, IoU 0.3 + ±1 s), pero el setup de 2
+mics da **2 oportunidades de detectar** cada evento → mayor recall potencial en mic. No se corrige
+con un factor (`÷2` sería erróneo: el dataset ya tiene 1 detección/evento); se declara como
+posible sesgo de sensibilidad al comparar conteos mic vs mobile.
+
 ---
 
 ## Reframe central: las 6 pasadas = estudio de fiabilidad
@@ -42,7 +49,7 @@ análisis contra ese suelo. Es el ancla metodológica del TFG.
 
 ---
 
-## Bloque A — Fiabilidad (6 pasadas ALDAIA-PAIPORTA)
+## Bloque A — Fiabilidad (6 pasadas ALDAIA-PAIPORTA)  *[implementado en NB-04 `04_reliability_and_classes.ipynb` S.A3 + NB-05 (repetibilidad)]*
 
 Valida todo lo demás.
 
@@ -55,15 +62,21 @@ Valida todo lo demás.
 
 ---
 
-## Bloque B — Estadística general (todos los trayectos)
+## Bloque B — Estadística general (todos los trayectos)  *[implementado en NB-04b `04b_class_statistics.ipynb` + NB-05 `05_acoustic_mobility.ipynb`]*
 
-- Densidad por clase: **det/km** y **det/min** (usa GPS + duración).
-- **Duración media de detección por clase** → exposición vs evento puntual.
+- Densidad por clase: **det/km** y **det/min** (usa GPS + duración).  *[ya — NB-04b]*
+- **Proporción de clases por fuente** (mix mic vs mobile).  *[ya — NB-03, NB-04b]*
+- **Duración media de detección por clase** → exposición vs evento puntual.  *[ya — NB-04b]*
 - **Índice de distracción** = % de tiempo con alguna clase-cabina activa (unión de intervalos).
   - Reportar también la versión por conteo de eventos (duración ≠ frecuencia, mensaje distinto).
+- **Exposición a Speech** *(implementado — NB-04b S5)*: aísla Speech del índice genérico de cabina.
+  - **% de tiempo de trayecto con Speech activo** = unión de intervalos `[x1_sec,x2_sec]` de Speech / duración del trayecto.
+  - **densidad Speech/min**.
+  - Comparar **mic (solo)** vs **mobile (acompañado)** → proxy de "acompañado habla más → distrae".
+    **Confound de sensor declarado** (nº mics, nr, rutas, fechas; ver aviso de validez).
 - **Perfil por velocidad** (velocidad derivada del GPS): bin de velocidad × clase
-  → hipótesis "parado/lento en cruce → más Horn/Speech".
-- **mic vs mobile:** descriptivo, **con confound declarado**.
+  → hipótesis "parado/lento en cruce → más Horn/Speech".  *[ya — NB-05]*
+- **mic vs mobile:** descriptivo, **con confound declarado** (sensor + recall 2-mics).  *[ya — NB-05 B4]*
 - **Tablas:** clase × (n, %, det/km, dur_media, conf_media, CV).
 
 ### Hipótesis candidatas a defender
@@ -73,15 +86,20 @@ Valida todo lo demás.
 
 ---
 
-## Bloque C — Mapas
+## Bloque C — Mapas  *[implementado en NB-06 `06_danger_maps.ipynb`]*
 
-Normalización explícita: **mic ÷2 micrófonos, mobile ÷1**.
+> **Sin normalización por nº de micrófonos.** El ETL ya aplica NMS cruzado M1/M2
+> (`scripts/prepare_mic.py:61` `cross_mic_nms`, IoU temporal **0.3** + ventana **±1 s**)
+> que fusiona las detecciones de los 2 micrófonos en **una sola por evento físico**.
+> El dataset final tiene 1 detección/evento en mic y en mobile → **NO se divide mic entre 2**
+> (hacerlo infra-contaría mic). El setup de 2 mics afecta al *recall* (2 oportunidades de
+> detectar), no al recuento de duplicados → tratado como confound de recall en el aviso de validez.
 
 1. **Exposición sonora** = Σ duración de detección por celda.
 2. **Densidad normalizada por tramo (1 km)** = det/seg de tramo → corrige velocidad/paradas.
 3. **Densidad normalizada por trayecto** → comparar rutas de distinta longitud.
 4. **Danger externo** = Horn×1 + Siren×2 (métrica ya existente).
-5. **Distracción cabina** = Σ clases-cabina, normalizada.
+5. **Distracción cabina** = Σ clases-cabina, normalizada por tramo/trayecto (no por nº de mics).
 6. **KDE / heatmap** de hotspots sobre todas las rutas.
 7. **Mapa de consistencia** (del Bloque A).
 
@@ -93,7 +111,7 @@ Cada métrica de ponderación responde una pregunta distinta:
 
 ---
 
-## Bloque D — Speech ↔ Ring Tone (artefacto del detector)
+## Bloque D — Speech ↔ Ring Tone (artefacto del detector)  *[implementado en NB-04b S6 (IoU temporal, asimetría, confidence) + S4 (co-ocurrencia)]*
 
 Hipótesis: YOLO predice Speech y Ring Tone juntas cuando suena música.
 (El doc técnico ya documenta que Wiener induce falsos Speech — banda de voz.)
@@ -121,16 +139,20 @@ se presenta como fortaleza metodológica, no como limitación.
 1. **Foco de la memoria:** ¿descriptivo (caracterizar el entorno sonoro) o accionable
    (mapa de peligro como producto)? Define qué bloque es resultado estrella vs apoyo.
 2. **Nº de trayectos mobile** aparte de las 6 pasadas (dimensiona el Bloque B).
-3. **Definición final del índice de distracción**: ¿duración (% tiempo activo) o conteo?
+3. **Definición final del índice de distracción**: ~~¿duración (% tiempo activo) o conteo?~~
+   *Parcialmente resuelto:* se reportan ambas versiones (duración y conteo); además Speech recibe
+   su propia métrica de exposición (% tiempo activo, ver Bloque B).
 
 ---
 
 ## Mapeo a notebooks (propuesto)
 
-| Bloque | Contenido | Notebook sugerido |
-|--------|-----------|-------------------|
-| A | Fiabilidad 6 pasadas (CV, consistencia espacial) | `04_reliability_and_classes.ipynb` |
-| B | Estadística general, densidades, velocidad | `04b_class_statistics.ipynb` |
-| B | Acústica vs movilidad (velocidad, distracción) | `05_acoustic_mobility.ipynb` |
-| C | Mapas ponderados, KDE, danger | `06_danger_maps.ipynb` |
-| D | Speech↔Ring Tone, artefactos | (sección en `04_reliability_and_classes.ipynb`) |
+| Bloque | Contenido | Notebook | Estado |
+|--------|-----------|----------|--------|
+| A | Fiabilidad 6 pasadas (CV, consistencia espacial) | `04_reliability_and_classes.ipynb` + `05` | implementado |
+| B | Estadística general, densidades, duración | `04b_class_statistics.ipynb` | implementado |
+| B | **Exposición a Speech** (% tiempo activo, Speech/min, mic vs mobile) | `04b_class_statistics.ipynb` S5 | implementado |
+| B | Acústica vs movilidad (velocidad, distracción) | `05_acoustic_mobility.ipynb` | implementado |
+| C | Mapas ponderados, KDE, danger (sin ÷n_mic) | `06_danger_maps.ipynb` | implementado |
+| C | **Densidad normalizada por tramo** (det/min exposición GPS por celda) | `06_danger_maps.ipynb` C5 | implementado |
+| D | Speech↔Ring Tone, artefactos | `04b` / `04_reliability_and_classes.ipynb` | implementado |
