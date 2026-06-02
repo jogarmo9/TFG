@@ -14,6 +14,7 @@ librosa
 soundfile
 miniaudio
 deepfilternet==0.5.6
+demucs==4.0.1
 noisereduce
 torch==2.0.1
 torchaudio==2.0.2

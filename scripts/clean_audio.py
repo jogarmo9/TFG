@@ -142,6 +142,78 @@ def clean_audio_dfn3(path_in: str, path_out: str, atten_lim_db: float = 75.0,
     sf.write(path_out, arr, 16_000, subtype="PCM_16")
 
 
+def _load_demucs_model(model_name: str = "htdemucs"):
+    """Carga modelo Demucs una sola vez.
+
+    Prioridad de dispositivo: CUDA (NVIDIA) > DirectML (AMD/Intel en Windows) > CPU.
+    model_name: 'htdemucs' (default) o 'htdemucs_ft' (mejor calidad, ~4x mas lento).
+    Devuelve (model, device_str).
+    """
+    import torch
+    from demucs.pretrained import get_model
+    model = get_model(model_name)
+    model.eval()
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        # DirectML: GPU AMD/Intel en Windows via torch-directml (pip install torch-directml)
+        try:
+            import torch_directml
+            device = torch_directml.device()
+            print("[DEMUCS] torch-directml disponible — usando GPU AMD/Intel")
+        except ImportError:
+            device = "cpu"
+
+    model.to(device)
+    print(f"[DEMUCS] modelo={model_name} | device={device} | stems={model.sources}")
+    return model, device
+
+
+def clean_audio_demucs(path_in: str, path_out: str, model, device: str = "cpu"):
+    """Extrae el stem de voz con Demucs. Salida: WAV mono 16kHz PCM_16.
+
+    Demucs es un separador de fuentes (no un denoiser): aísla la voz de la mezcla.
+    En chunks sin voz el stem queda casi en silencio → evita FP de Speech en YOLO.
+
+    model/device: pasar para reusar modelo ya cargado (evita recarga por fichero).
+    """
+    import torch
+    import soundfile as sf
+    import librosa
+    from demucs.apply import apply_model
+
+    os.makedirs(os.path.dirname(path_out) or ".", exist_ok=True)
+
+    # 1) Cargar WAV crudo 16 kHz mono
+    audio, _ = librosa.load(path_in, sr=16_000, mono=True)
+
+    # 2) Resamplear a la SR del modelo (44100) y duplicar a estéreo (Demucs espera 2 canales)
+    model_sr = model.samplerate
+    audio_rs = librosa.resample(audio, orig_sr=16_000, target_sr=model_sr,
+                                res_type='kaiser_best')
+    wav = torch.from_numpy(audio_rs).float().unsqueeze(0)              # (1, samples)
+    wav = wav.repeat(model.audio_channels, 1)                         # (channels, samples)
+
+    # 3) Normalizar (igual que el preprocesado interno de Demucs), separar, desnormalizar
+    ref = wav.mean(0)
+    mean, std = ref.mean(), ref.std()
+    wav = (wav - mean) / (std + 1e-8)
+    with torch.no_grad():
+        sources = apply_model(model, wav[None].to(device), device=device,
+                              split=True, overlap=0.25, progress=False)[0]
+    sources = sources * std + mean                                   # (stems, channels, samples)
+
+    # 4) Stem de voz → mono
+    vocals = sources[model.sources.index("vocals")].mean(0).cpu().numpy()
+
+    # 5) Resamplear de vuelta a 16 kHz y guardar PCM_16
+    if model_sr != 16_000:
+        vocals = librosa.resample(vocals, orig_sr=model_sr, target_sr=16_000,
+                                  res_type='kaiser_best')
+    sf.write(path_out, vocals, 16_000, subtype="PCM_16")
+
+
 def clean_audio(path_in,
                 path_out,
                 clip_thresh=0.85,
@@ -152,7 +224,8 @@ def clean_audio(path_in,
                 impulse_removal=False,
                 impulse_kernel=11,
                 impulse_threshold=2.5,
-                impulse_passes=2):
+                impulse_passes=2,
+                hpss_kernel=0):
 
     # =========================
     # CARGA SEGURA DEL WAV
@@ -232,6 +305,20 @@ def clean_audio(path_in,
 
         audio = filtfilt(b, a, audio)
 
+        # =========================
+        # FASE 5: HPSS ARMÓNICO (opcional)
+        # Aplicado sobre el archivo completo → sin artefactos de borde.
+        # Elimina componente percusiva (crispeos, impulsos) que causa FP
+        # en Ring Tone y Vibrating. Solo para clases != Speech (pass 1 Wiener).
+        # =========================
+        if hpss_kernel > 0:
+            import librosa as _lb
+            _N_FFT, _HOP = 2048, 256
+            D = _lb.stft(audio, n_fft=_N_FFT, hop_length=_HOP, win_length=_N_FFT)
+            D_harm, _ = _lb.decompose.hpss(D, kernel_size=hpss_kernel)
+            audio = _lb.istft(D_harm, hop_length=_HOP, win_length=_N_FFT,
+                              length=len(audio))
+
         results.append((
             np.clip(audio, -1, 1),
             pct_total
@@ -274,14 +361,21 @@ if __name__ == "__main__":
     _ROOT = Path(__file__).parent.parent
 
     parser = argparse.ArgumentParser(description="Limpia audios WAV con filtro Wiener + declipping o DeepFilterNet3")
-    parser.add_argument("--method", choices=["wiener", "dfn3"], default="wiener",
-                        help="Método de limpieza: 'wiener' (default) o 'dfn3' (DeepFilterNet3)")
+    parser.add_argument("--method", choices=["wiener", "dfn3", "demucs"], default="wiener",
+                        help="Método de limpieza: 'wiener' (default), 'dfn3' (DeepFilterNet3) "
+                             "o 'demucs' (separación de voz, stem vocals)")
+    parser.add_argument("--demucs-model", default="htdemucs",
+                        choices=["htdemucs", "htdemucs_ft"],
+                        help="Modelo Demucs: 'htdemucs' (default) o 'htdemucs_ft' (mejor, más lento)")
     parser.add_argument("--passes", type=int, default=2, help="Pasadas Wiener (default: 2, ignorado en dfn3)")
     parser.add_argument("--impulse-removal", action="store_true",
                         help="Aplica remove_impulses antes de Wiener (elimina clicks/crispeos)")
     parser.add_argument("--impulse-kernel", type=int, default=11)
     parser.add_argument("--impulse-threshold", type=float, default=2.5)
     parser.add_argument("--impulse-passes", type=int, default=2)
+    parser.add_argument("--hpss-kernel", type=int, default=0,
+                        help="HPSS harmónico: kernel size (0=desactivado). "
+                             "Recomendado 61 para Wiener pass 1 (clases != Speech).")
     parser.add_argument("--atten-lim-db", type=float, default=75.0,
                         help="DFN3: máximo dB de supresión (default: 75.0)")
     parser.add_argument("--date-from", default=None,
@@ -301,6 +395,8 @@ if __name__ == "__main__":
         clean_dir = Path(args.clean_dir)
     elif args.method == "dfn3":
         clean_dir = _ROOT / "data" / "clean_dfn"
+    elif args.method == "demucs":
+        clean_dir = _ROOT / "data" / "clean_demucs"
     else:
         clean_dir = _ROOT / "data" / "clean"
 
@@ -322,6 +418,11 @@ if __name__ == "__main__":
         dfn3_model = dfn3_state = None
         if args.method == "dfn3":
             dfn3_model, dfn3_state = _load_dfn3_model()
+
+        # Carga Demucs una sola vez antes del loop
+        demucs_model = demucs_device = None
+        if args.method == "demucs":
+            demucs_model, demucs_device = _load_demucs_model(args.demucs_model)
 
         date_from = args.date_from  # e.g. "20260311"
         date_to   = args.date_to    # e.g. "20260424"
@@ -356,14 +457,20 @@ if __name__ == "__main__":
                     clean_audio_dfn3(str(f), str(out_path), atten_lim_db=args.atten_lim_db,
                                      model=dfn3_model, df_state=dfn3_state)
                     print(f"[OK] {filename} | atten_lim_db={args.atten_lim_db}")
+                elif args.method == "demucs":
+                    clean_audio_demucs(str(f), str(out_path),
+                                       model=demucs_model, device=demucs_device)
+                    print(f"[OK] {filename} | demucs={args.demucs_model} (stem voz)")
                 else:
                     pct = clean_audio(str(f), str(out_path),
                                       passes=args.passes,
                                       impulse_removal=args.impulse_removal,
                                       impulse_kernel=args.impulse_kernel,
                                       impulse_threshold=args.impulse_threshold,
-                                      impulse_passes=args.impulse_passes)
-                    print(f"[OK] {filename} | clipping detectado: {pct:.2f}%")
+                                      impulse_passes=args.impulse_passes,
+                                      hpss_kernel=args.hpss_kernel)
+                    hpss_note = f" + HPSS k={args.hpss_kernel}" if args.hpss_kernel else ""
+                    print(f"[OK] {filename} | clipping: {pct:.2f}%{hpss_note}")
                 ok += 1
 
             except Exception as e:

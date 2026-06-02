@@ -5,7 +5,7 @@
 Los WAVs limpios se pasan por el modelo YOLOv5n ONNX para detectar eventos acústicos. El pipeline produce timestamps absolutos de cada detección (onset/offset UTC) y los almacena en CSV.
 
 **Script:** `scripts/infer_clean.py`  
-**Entradas:** `data/clean/*.wav` + `data/clean_dfn/*.wav` (modo dual)  
+**Entradas:** `data/clean/*.wav` (pass 1) + `data/clean_demucs/*.wav` o `data/clean_dfn/*.wav` (pass 2 Speech)  
 **Salida:** `data/processed/predicciones_clean.csv`
 
 ---
@@ -103,18 +103,25 @@ offset = file_start + chunk_i × 10s + x2_sec
 
 ## 3.3 Modo Dual-Clean (procesamiento diferenciado por clase)
 
-Activa con `--dual-clean`. Combina Wiener e ImpWiener (para clases ≠ Speech) con DFN3 (para Speech).
+Activa con `--dual-clean`. Combina Wiener (clases != Speech) con separación de voz Demucs (Speech).
 
 ```
-PASS 1: data/clean/    → inferir todas las clases EXCEPTO Speech (class_id=4)
-PASS 2: data/clean_dfn/ → inferir SOLO Speech (class_id=4)
+PASS 1: data/clean/         → inferir todas las clases EXCEPTO Speech (class_id=4)
+PASS 2: data/clean_demucs/  → inferir SOLO Speech (class_id=4)   ← método actual
+       (o data/clean_dfn/   → Speech con DFN3 legacy, via --speech-source dfn3)
 → combinar en predicciones_clean.csv
 ```
 
-**Justificación:** Wiener genera armónicos residuales en la banda de voz que provocan falsos positivos en Speech. DFN3 suprime el ruido sin introducir estos artefactos. Para las demás clases, Wiener es suficiente y más rápido.
+**Justificación pass 1:** Wiener genera armónicos residuales en la banda de voz que provocan FP en Speech. Para las demás clases (Horn, Siren, Ring Tone…) Wiener es suficiente y más rápido.
+
+**Justificación pass 2:** DFN3 (denoiser) deja residuo tonal con ruido muy intenso → YOLO predice Speech FP. Demucs (separador de fuentes) extrae el stem de voz: sin voz real → stem silencioso → sin FP. Ver [02_preprocesado_mic.md §2.2](02_preprocesado_mic.md).
 
 ```bash
+# Demucs (default, método actual)
 python scripts/infer_clean.py --dual-clean
+
+# DFN3 legacy (comparación)
+python scripts/infer_clean.py --dual-clean --speech-source dfn3
 ```
 
 ### Aceleración GPU (ONNX)

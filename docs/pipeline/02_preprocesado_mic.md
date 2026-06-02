@@ -2,7 +2,7 @@
 
 ## Descripción
 
-Los WAVs brutos de `data/audios/` se limpian antes de la inferencia. El pipeline aplica una cadena de filtros para eliminar ruido estacionario, impulsos (clicks/crispeos) y artefactos de saturación. La salida se almacena en `data/clean/` (Wiener) y `data/clean_dfn/` (DFN3 para Speech).
+Los WAVs brutos de `data/audios/` se limpian antes de la inferencia. El pipeline aplica una cadena de filtros para eliminar ruido estacionario, impulsos (clicks/crispeos) y artefactos de saturación. La salida se almacena en `data/clean/` (Wiener), `data/clean_dfn/` (DFN3 legacy) y `data/clean_demucs/` (Demucs — separación de voz, método actual para Speech).
 
 **Script:** `scripts/clean_audio.py`
 
@@ -69,40 +69,64 @@ python scripts/clean_audio.py --method wiener --impulse-removal --reprocess-all
 
 ---
 
-## 2.2 Pipeline DFN3 → `data/clean_dfn/`
+## 2.2 Pipeline Demucs → `data/clean_demucs/` *(método actual para Speech)*
 
-Usado exclusivamente para inferencia de la clase **Speech** (ver Paso 3).
+Reemplaza DFN3 como preprocesado del pass 2 (Speech). Separación de fuentes en vez de denoising.
 
-### ¿Por qué DFN3 para Speech?
-El filtro Wiener genera armonicos residuales en la banda de voz (300–3000 Hz) como artefacto del hard-thresholding. El modelo YOLO es sensible a estas resonancias y las clasifica erróneamente como Speech → falsos positivos elevados. DeepFilterNet3 (DFN3) utiliza una red neuronal profunda que preserva la estructura tonal de la voz sin introducir residuos armónicos.
+### ¿Por qué Demucs en lugar de DFN3?
 
-### DeepFilterNet3
-- Red neuronal de denoising en el dominio ERBN (bandas de ruido de banda uniforme)
-- Parámetro clave: `atten_lim_db` = máximo dB de supresión
-  - 75 dB: supresión agresiva, mantiene estructura harmónica de voz → elegido en nb05
-  - 100 dB: sin límite de supresión
-- SR interno: 48.000 Hz (el pipeline resamplea 16kHz→48kHz→16kHz)
-- Requiere Python 3.11 (entorno `.venv311`)
+DFN3 es un *denoiser*: atenúa el ruido estacionario pero deja residuo tonal cuando el ruido es muy intenso (motor, tráfico). Ese residuo tiene estructura armónica que YOLO confunde con voz → falsos positivos de Speech elevados. Ajustar `atten_lim_db` no resuelve el problema con ruido intenso.
 
-### Cadena DFN3
+**Demucs** (`htdemucs`) es un *separador de fuentes*: extrae el stem de **voz** de la mezcla sin intentar atenuar el resto. En chunks sin voz real, el stem queda casi en silencio → YOLO no detecta Speech. La voz real sobrevive limpia. Cambia el mecanismo, no el parámetro.
+
+### Cadena Demucs
 ```
-WAV bruto → librosa resample 16k→48k → DFN3 (atten_lim_db=75) → librosa resample 48k→16k → WAV
+WAV bruto (16k) → resample 16k→44.1k → estéreo → htdemucs → stem vocals → mono → resample 44.1k→16k → WAV
 ```
 
-### Optimizaciones implementadas
-- **Modelo cargado una sola vez** (`_load_dfn3_model()`) antes del loop → evita recarga ×16k
-- **CUDA automático**: `model.to("cuda")` + `audio.to("cuda")` si `torch.cuda.is_available()`
-- En CPU: ~2-5s por fichero; en GPU: ~0.3-1s por fichero
+### Parámetros
+- Modelo: `htdemucs` (default) o `htdemucs_ft` (mejor calidad, ~4x más lento)
+- SR interno: 44.100 Hz; salida: 16.000 Hz PCM_16
+- Requiere `.venv311` (Python 3.11 + torch)
+
+### Selección de dispositivo (automático)
+Prioridad: **CUDA** (NVIDIA) > **DirectML** (GPU AMD/Intel en Windows, `pip install torch-directml`) > **CPU**
+
+- CPU: ~10 s por fichero de 5 s
+- GPU: sustancialmente más rápido
 
 ### Ejecución
 ```bash
 # Requiere .venv311
+.venv311\Scripts\python.exe scripts/clean_audio.py --method demucs --reprocess-all
+
+# Modelo de mayor calidad (más lento)
+.venv311\Scripts\python.exe scripts/clean_audio.py --method demucs --demucs-model htdemucs_ft --reprocess-all
+
+# Solo un rango de fechas (recomendado para validar antes del lote completo)
+.venv311\Scripts\python.exe scripts/clean_audio.py --method demucs --date-from 20260414 --date-to 20260414
+```
+
+---
+
+## 2.3 Pipeline DFN3 → `data/clean_dfn/` *(legacy)*
+
+Método anterior para Speech. Conservado por compatibilidad y para comparación en NB-07.
+
+### DeepFilterNet3
+- Red neuronal de denoising en el dominio ERBN
+- `atten_lim_db=75`: supresión agresiva conservando estructura tonal de voz
+- SR interno: 48.000 Hz; requiere Python 3.11 (`.venv311`)
+- Limitación: residuo tonal con ruido muy intenso → FP de Speech
+
+### Ejecución
+```bash
 .venv311\Scripts\python.exe scripts/clean_audio.py --method dfn3 --atten-lim-db 75.0 --reprocess-all
 ```
 
 ---
 
-## 2.3 Parámetros configurables
+## 2.4 Parámetros configurables
 
 | Parámetro | Default | CLI flag | Descripción |
 |-----------|---------|----------|-------------|
@@ -118,11 +142,12 @@ WAV bruto → librosa resample 16k→48k → DFN3 (atten_lim_db=75) → librosa 
 
 ---
 
-## 2.4 Salidas
+## 2.5 Salidas
 
 | Directorio | Contenido | Usado para |
 |------------|-----------|-----------|
-| `data/clean/` | WAV Wiener+ImpWiener | Inferencia clases ≠ Speech |
-| `data/clean_dfn/` | WAV DFN3-75 | Inferencia clase Speech |
+| `data/clean/` | WAV Wiener+ImpWiener | Inferencia clases != Speech (pass 1) |
+| `data/clean_demucs/` | WAV stem vocals Demucs | Inferencia Speech — **método actual** |
+| `data/clean_dfn/` | WAV DFN3-75 | Inferencia Speech — legacy (comparación) |
 
 Los WAVs mantienen el mismo nombre que el original en `data/audios/`.

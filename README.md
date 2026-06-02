@@ -14,7 +14,8 @@ TFG/
 │   ├── audios/          WAVs brutos micrófonos (entrada a clean_audio.py)
 │   ├── raw/             GPX + predicciones raw originales (por fecha)
 │   ├── clean/           WAVs limpios Wiener+ImpWiener
-│   ├── clean_dfn/       WAVs limpios DFN3-75 (Speech)
+│   ├── clean_demucs/    WAVs stem voz Demucs (Speech — método actual)
+│   ├── clean_dfn/       WAVs limpios DFN3-75 (Speech — legacy)
 │   ├── mobile/          Sesiones smartphone (audio + meta.json + track.gpx)
 │   └── processed/       Outputs del ETL
 │       ├── predicciones_clean.csv      inferencia mic (CSV raw)
@@ -72,7 +73,7 @@ TFG/
 pip install -r requirements.txt
 ```
 
-DFN3 (Speech) requiere `.venv311` (Python 3.11). Ver [`docs/pipeline/02_preprocesado_mic.md`](docs/pipeline/02_preprocesado_mic.md).
+Demucs y DFN3 (Speech) requieren `.venv311` (Python 3.11). GPU AMD en Windows: `pip install torch-directml`. Ver [`docs/pipeline/02_preprocesado_mic.md`](docs/pipeline/02_preprocesado_mic.md).
 
 ---
 
@@ -84,10 +85,10 @@ DFN3 (Speech) requiere `.venv311` (Python 3.11). Ver [`docs/pipeline/02_preproce
 # Paso 1 — Preprocesado Wiener+ImpWiener (clases ≠ Speech)
 python scripts/clean_audio.py --method wiener --impulse-removal
 
-# Paso 2 — Preprocesado DFN3-75 (solo Speech) — requiere .venv311
-.venv311\Scripts\python.exe scripts/clean_audio.py --method dfn3 --atten-lim-db 75.0
+# Paso 2 — Preprocesado Demucs (stem voz, solo Speech) — requiere .venv311
+.venv311\Scripts\python.exe scripts/clean_audio.py --method demucs
 
-# Paso 3 — Inferencia YOLO dual-clean
+# Paso 3 — Inferencia YOLO dual-clean (pass 2 Speech usa Demucs por defecto)
 python scripts/infer_clean.py --dual-clean
 
 # Paso 4 — Pipeline móvil (si hay sesiones nuevas)

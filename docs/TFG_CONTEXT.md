@@ -107,7 +107,9 @@ CAPTURA
                                                                           │
 PREPROCESADO                                                              │
 ├── Mic: clean_audio.py                                                   │
-│   ├── data/clean/    ← Wiener+ImpWiener (Declip→Mediana×2→Wiener×2→HP→LP)
+│   ├── data/clean/    ← Wiener+ImpWiener+HPSS-61                        │
+│   │     Declip→Mediana×2→Wiener×2→HP→LP→HPSS armónico k=61             │
+│   │     (HPSS elimina crispeos percusivos → reduce FP Ring Tone/Vibrat.)│
 │   └── data/clean_dfn/ ← DFN3-75 (para Speech solamente)               │
 │                                                                          │
 └── Mobile: prepare_mobile.py (inline)                                    │
@@ -115,7 +117,7 @@ PREPROCESADO                                                              │
                                                                           │
 INFERENCIA                                                                │
 ├── Mic: infer_clean.py --dual-clean                                      │
-│   ├── data/clean/    → YOLO clases ≠ Speech                            │
+│   ├── data/clean/    → YOLO clases ≠ Speech  (HPSS ya aplicado)        │
 │   └── data/clean_dfn/ → YOLO clase Speech                              │
 │   └── → data/processed/predicciones_clean.csv                          │
 │                                                                          │
