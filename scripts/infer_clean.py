@@ -31,9 +31,13 @@ _ROOT           = Path(__file__).parent.parent
 CLEAN_DIR        = _ROOT / "data" / "clean"
 CLEAN_DFN_DIR    = _ROOT / "data" / "clean_dfn"
 CLEAN_DEMUCS_DIR = _ROOT / "data" / "clean_demucs"
+CLEAN_CAND_DIR   = _ROOT / "data" / "clean_cand"        # Wiener-solo-sin-HPSS (Etapa A)
 MODEL_PATH      = _ROOT / "models" / "YOLOv5n_original.onnx"
 OUTPUT_CSV      = _ROOT / "data" / "processed" / "predicciones_clean.csv"
 OUTPUT_CSV_RAW  = _ROOT / "data" / "processed" / "predicciones_clean_raw.csv"
+CANDIDATES_FILE = _ROOT / "data" / "processed" / "speech_candidates.txt"
+
+CAND_CONF   = 0.06          # umbral (bajo) para el prefiltro de candidatos Speech
 
 SPEECH_ID   = 4
 ALL_CLASSES = set(range(9))
@@ -190,10 +194,11 @@ def infer_chunk(session, chunk: np.ndarray, conf_thresh: float) -> list:
 # PROCESS ONE FILE
 # ──────────────────────────────────────────────────────────────
 def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_start: datetime,
-                 source_file: str, session_id: str, class_filter=None):
+                 source_file: str, session_id: str, class_filter=None, conf_thresh: float = CONF_THRESH):
     """
     Chunks the audio, runs inference, and writes rows to both CSV writers.
     class_filter: set of class_ids to keep, or None for all classes.
+    conf_thresh: umbral de confianza (default CONF_THRESH=0.1; mas bajo para candidatos).
     """
     audio, _ = lb.load(str(wav_path), sr=SR, mono=True)
 
@@ -207,7 +212,7 @@ def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_
             chunk = np.pad(chunk, (0, CHUNK_SAMP - len(chunk)))
 
         chunk_offset = timedelta(seconds=i * CHUNK_SEC)
-        raw_boxes    = infer_chunk(session, chunk, CONF_THRESH)
+        raw_boxes    = infer_chunk(session, chunk, conf_thresh)
         detections   = nms(raw_boxes, IOU_THRESH)
 
         for x1, x2, cls_id, conf in raw_boxes:
@@ -230,10 +235,34 @@ def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_
 # ──────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────
+def _in_date_range(name: str, date_from: str, date_to: str) -> bool:
+    """Filtra por la fecha YYYYMMDD embebida en el nombre (inclusive)."""
+    d = name[:8]
+    if not d.isdigit():
+        return True
+    if date_from and d < date_from:
+        return False
+    if date_to and d > date_to:
+        return False
+    return True
+
+
 def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
-             class_filter=None, already_done: set = None) -> tuple[int, int]:
-    """Procesa todos los WAVs en wav_dir, escribe a ambos writers. Retorna (ok, fail)."""
+             class_filter=None, already_done: set = None,
+             conf_thresh: float = CONF_THRESH, only_files: set = None,
+             date_from: str = None, date_to: str = None) -> tuple[int, int]:
+    """Procesa todos los WAVs en wav_dir, escribe a ambos writers. Retorna (ok, fail).
+
+    conf_thresh: umbral de confianza propagado a process_file.
+    only_files:  si se pasa, procesa solo los WAVs cuyo nombre este en este set
+                 (subconjunto de candidatos Speech).
+    date_from/date_to: filtro YYYYMMDD inclusive por fecha en el nombre.
+    """
     wav_files = sorted(wav_dir.glob("*.wav"))
+    if only_files is not None:
+        wav_files = [w for w in wav_files if w.name in only_files]
+    if date_from or date_to:
+        wav_files = [w for w in wav_files if _in_date_range(w.name, date_from, date_to)]
     if not wav_files:
         print(f"  [WARN] No se encontraron .wav en {wav_dir}")
         return 0, 0
@@ -254,7 +283,7 @@ def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
             session_id = f"{file_start.year}{file_start.month:02d}{file_start.day:02d}"
             process_file(infer_session, wav_path, writer, raw_writer,
                          mic_id, file_start, filename, session_id,
-                         class_filter=class_filter)
+                         class_filter=class_filter, conf_thresh=conf_thresh)
             label = "" if class_filter is None else f" (clases {sorted(class_filter)})"
             print(f"  [OK] {filename}{label}")
             ok += 1
@@ -262,6 +291,54 @@ def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
             print(f"  [ERROR] {filename} – {e}")
             fail += 1
     return ok, fail
+
+
+# ──────────────────────────────────────────────────────────────
+# ETAPA A — construir lista de candidatos Speech (sin escribir CSV)
+# ──────────────────────────────────────────────────────────────
+def _build_candidates(infer_session, cand_dir: Path, out_path: Path,
+                      conf_thresh: float) -> int:
+    """Corre YOLO clase 4 sobre cand_dir y vuelca los nombres de fichero que
+    disparan >=1 deteccion Speech a out_path (uno por linea). Retorna N candidatos.
+
+    Prefiltro recall-safe: cand_dir debe ser Wiener-solo-sin-HPSS (preserva
+    fricativas; el ruido musical sobre-produce Speech -> alta sensibilidad).
+    """
+    wav_files = sorted(cand_dir.glob("*.wav"))
+    if not wav_files:
+        sys.exit(f"[ERROR] No se encontraron .wav en {cand_dir}")
+
+    print(f"[BUILD-CANDIDATES] {len(wav_files)} WAVs en {cand_dir.name}/ | "
+          f"clase=Speech({SPEECH_ID}) | conf>={conf_thresh}")
+    candidates = []
+    for n, wav_path in enumerate(wav_files, 1):
+        try:
+            audio, _ = lb.load(str(wav_path), sr=SR, mono=True)
+            n_chunks = max(1, int(np.ceil(len(audio) / CHUNK_SAMP)))
+            hit = False
+            for i in range(n_chunks):
+                chunk = audio[i * CHUNK_SAMP : (i + 1) * CHUNK_SAMP]
+                if len(chunk) < CHUNK_SAMP:
+                    chunk = np.pad(chunk, (0, CHUNK_SAMP - len(chunk)))
+                for _x1, _x2, cls_id, _conf in infer_chunk(infer_session, chunk, conf_thresh):
+                    if cls_id == SPEECH_ID:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                candidates.append(wav_path.name)
+        except Exception as e:
+            print(f"  [ERROR] {wav_path.name} – {e}")
+        if n % 500 == 0:
+            print(f"  ... {n}/{len(wav_files)} | candidatos: {len(candidates)}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(candidates) + ("\n" if candidates else ""))
+    print(f"[BUILD-CANDIDATES] {len(candidates)}/{len(wav_files)} candidatos "
+          f"({len(candidates)/len(wav_files)*100:.1f}%) -> {out_path}")
+    return len(candidates)
 
 
 def main():
@@ -275,6 +352,21 @@ def main():
     parser.add_argument("--speech-source", choices=["demucs", "dfn3"], default="demucs",
                         help="Fuente del pass 2 (Speech): 'demucs' (data/clean_demucs/, default) "
                              "o 'dfn3' (data/clean_dfn/).")
+    parser.add_argument("--build-candidates", action="store_true",
+                        help="Etapa A: corre YOLO Speech sobre --cand-dir y vuelca los ficheros "
+                             "que disparan clase 4 a speech_candidates.txt (no escribe CSV).")
+    parser.add_argument("--cand-dir", default=str(CLEAN_CAND_DIR),
+                        help="Carpeta para --build-candidates (default: data/clean_cand, "
+                             "debe ser Wiener-solo-sin-HPSS).")
+    parser.add_argument("--cand-conf", type=float, default=CAND_CONF,
+                        help=f"Umbral de confianza del prefiltro de candidatos (default: {CAND_CONF}).")
+    parser.add_argument("--use-candidates", action="store_true",
+                        help="En --dual-clean: el pass 2 (Speech) procesa solo los ficheros "
+                             "listados en speech_candidates.txt.")
+    parser.add_argument("--date-from", default=None,
+                        help="Procesar solo ficheros desde esta fecha (YYYYMMDD, inclusive).")
+    parser.add_argument("--date-to", default=None,
+                        help="Procesar solo ficheros hasta esta fecha (YYYYMMDD, inclusive).")
     args = parser.parse_args()
 
     if not MODEL_PATH.exists():
@@ -294,6 +386,17 @@ def main():
     infer_session = ort.InferenceSession(str(MODEL_PATH), providers=providers)
     print(f"[INFO] ONNX provider: {infer_session.get_providers()[0]}")
 
+    # ── ETAPA A: construir candidatos Speech y salir ──────────────────────────
+    if args.build_candidates:
+        cand_dir = Path(args.cand_dir)
+        if not cand_dir.exists():
+            sys.exit(f"[ERROR] Carpeta de candidatos no encontrada: {cand_dir}\n"
+                     f"       Generar Wiener-solo-sin-HPSS primero:\n"
+                     f"       python scripts/clean_audio.py --method wiener --passes 2 "
+                     f"--hpss-kernel 0 --clean-dir {cand_dir}")
+        _build_candidates(infer_session, cand_dir, CANDIDATES_FILE, args.cand_conf)
+        return
+
     header = ["mic_id", "timestamp_onset", "timestamp_offset",
               "class_id", "confidence", "source_file", "session_id", "source"]
 
@@ -305,6 +408,16 @@ def main():
         if not speech_dir.exists():
             sys.exit(f"[ERROR] Carpeta Speech no encontrada: {speech_dir}\n"
                      f"       Ejecutar primero: python scripts/clean_audio.py --method {args.speech_source}")
+        only_files = None
+        if args.use_candidates:
+            if not CANDIDATES_FILE.exists():
+                sys.exit(f"[ERROR] {CANDIDATES_FILE} no existe. Ejecutar primero:\n"
+                         f"       python scripts/infer_clean.py --build-candidates")
+            with open(CANDIDATES_FILE, "r", encoding="utf-8") as f:
+                only_files = {ln.strip() for ln in f if ln.strip()}
+            print(f"[INFO] use-candidates: pass 2 limitado a {len(only_files)} ficheros "
+                  f"de {CANDIDATES_FILE.name}")
+
         print(f"[INFO] Modo DUAL-CLEAN: Wiener→clases≠Speech | {speech_tag}→Speech")
         print(f"[INFO] Salida CSV: {OUTPUT_CSV} (modo: sobreescribir)")
         with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as fcsv, \
@@ -316,11 +429,13 @@ def main():
 
             print(f"\n[PASS 1] Wiener ({CLEAN_DIR.name}/) → clases≠Speech")
             ok1, fail1 = _run_dir(infer_session, CLEAN_DIR, writer, raw_writer,
-                                  class_filter=ALL_CLASSES - {SPEECH_ID})
+                                  class_filter=ALL_CLASSES - {SPEECH_ID},
+                                  date_from=args.date_from, date_to=args.date_to)
 
             print(f"\n[PASS 2] {speech_tag} ({speech_dir.name}/) → Speech únicamente")
             ok2, fail2 = _run_dir(infer_session, speech_dir, writer, raw_writer,
-                                  class_filter={SPEECH_ID})
+                                  class_filter={SPEECH_ID}, only_files=only_files,
+                                  date_from=args.date_from, date_to=args.date_to)
 
         print(f"\n{'='*50}")
         print(f"Procesados OK : {ok1 + ok2}  (Wiener: {ok1} | {speech_tag}: {ok2})")
@@ -361,7 +476,8 @@ def main():
                 raw_writer.writerow(header)
 
             ok, fail = _run_dir(infer_session, CLEAN_DIR, writer, raw_writer,
-                                class_filter=None, already_done=already_done)
+                                class_filter=None, already_done=already_done,
+                                date_from=args.date_from, date_to=args.date_to)
 
         print(f"\n{'='*50}")
         print(f"Procesados OK : {ok}")

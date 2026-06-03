@@ -9,6 +9,29 @@ import os
 from pathlib import Path
 
 
+def _select_torch_device(tag: str = ""):
+    """Devuelve (device, kind) con prioridad CUDA > DirectML > CPU.
+
+    kind in {'cuda','dml','cpu'}. Captura Exception (no solo ImportError):
+    la init de torch_directml puede fallar en runtime por DLL/driver ausentes.
+    """
+    import torch
+    if torch.cuda.is_available():
+        if tag:
+            print(f"[{tag}] CUDA disponible — usando GPU NVIDIA")
+        return torch.device("cuda"), "cuda"
+    try:
+        import torch_directml
+        dev = torch_directml.device()
+        if tag:
+            print(f"[{tag}] torch-directml disponible — usando GPU AMD/Intel")
+        return dev, "dml"
+    except Exception:
+        if tag:
+            print(f"[{tag}] sin GPU — usando CPU")
+        return torch.device("cpu"), "cpu"
+
+
 def _declip_pass(audio, clip_thresh):
     mask = np.abs(audio) >= clip_thresh
     pct = mask.mean() * 100
@@ -149,28 +172,18 @@ def _load_demucs_model(model_name: str = "htdemucs"):
     model_name: 'htdemucs' (default) o 'htdemucs_ft' (mejor calidad, ~4x mas lento).
     Devuelve (model, device_str).
     """
-    import torch
     from demucs.pretrained import get_model
     model = get_model(model_name)
     model.eval()
 
-    if torch.cuda.is_available():
-        device = "cuda"
-    else:
-        # DirectML: GPU AMD/Intel en Windows via torch-directml (pip install torch-directml)
-        try:
-            import torch_directml
-            device = torch_directml.device()
-            print("[DEMUCS] torch-directml disponible — usando GPU AMD/Intel")
-        except ImportError:
-            device = "cpu"
-
+    device, _kind = _select_torch_device("DEMUCS")
     model.to(device)
     print(f"[DEMUCS] modelo={model_name} | device={device} | stems={model.sources}")
     return model, device
 
 
-def clean_audio_demucs(path_in: str, path_out: str, model, device: str = "cpu"):
+def clean_audio_demucs(path_in: str, path_out: str, model, device: str = "cpu",
+                       overlap: float = 0.25):
     """Extrae el stem de voz con Demucs. Salida: WAV mono 16kHz PCM_16.
 
     Demucs es un separador de fuentes (no un denoiser): aísla la voz de la mezcla.
@@ -201,7 +214,7 @@ def clean_audio_demucs(path_in: str, path_out: str, model, device: str = "cpu"):
     wav = (wav - mean) / (std + 1e-8)
     with torch.no_grad():
         sources = apply_model(model, wav[None].to(device), device=device,
-                              split=True, overlap=0.25, progress=False)[0]
+                              split=True, overlap=overlap, progress=False)[0]
     sources = sources * std + mean                                   # (stems, channels, samples)
 
     # 4) Stem de voz → mono
@@ -367,6 +380,9 @@ if __name__ == "__main__":
     parser.add_argument("--demucs-model", default="htdemucs",
                         choices=["htdemucs", "htdemucs_ft"],
                         help="Modelo Demucs: 'htdemucs' (default) o 'htdemucs_ft' (mejor, más lento)")
+    parser.add_argument("--demucs-overlap", type=float, default=0.25,
+                        help="Solape entre segmentos Demucs (default 0.25). 0.1 = ~25%% mas rapido, "
+                             "perdida minima de calidad.")
     parser.add_argument("--passes", type=int, default=2, help="Pasadas Wiener (default: 2, ignorado en dfn3)")
     parser.add_argument("--impulse-removal", action="store_true",
                         help="Aplica remove_impulses antes de Wiener (elimina clicks/crispeos)")
@@ -388,6 +404,9 @@ if __name__ == "__main__":
                         help="Carpeta con WAVs de entrada (default: data/audios)")
     parser.add_argument("--clean-dir", default=None,
                         help="Carpeta de salida (default: data/clean para wiener, data/clean_dfn para dfn3)")
+    parser.add_argument("--file-list", default=None,
+                        help="Procesar solo los WAVs nombrados en este fichero (uno por linea). "
+                             "Para limpiar solo el subconjunto de candidatos Speech.")
     args = parser.parse_args()
 
     audios_dir = Path(args.audios_dir)
@@ -402,7 +421,18 @@ if __name__ == "__main__":
 
     os.makedirs(clean_dir, exist_ok=True)
 
-    wavs = sorted(audios_dir.glob("*.wav"))
+    if args.file_list:
+        fl = Path(args.file_list)
+        if not fl.exists():
+            raise SystemExit(f"[ERROR] --file-list no encontrado: {fl}")
+        with open(fl, "r", encoding="utf-8") as f:
+            names = {ln.strip() for ln in f if ln.strip()}
+        wavs = sorted(p for p in (audios_dir / n for n in names) if p.exists())
+        missing = len(names) - len(wavs)
+        print(f"[INFO] --file-list: {len(wavs)} WAVs a procesar"
+              + (f" ({missing} no encontrados en {audios_dir.name}/)" if missing else ""))
+    else:
+        wavs = sorted(audios_dir.glob("*.wav"))
 
     if not wavs:
         print(f"No se encontraron archivos .wav en {audios_dir}/")
@@ -459,7 +489,8 @@ if __name__ == "__main__":
                     print(f"[OK] {filename} | atten_lim_db={args.atten_lim_db}")
                 elif args.method == "demucs":
                     clean_audio_demucs(str(f), str(out_path),
-                                       model=demucs_model, device=demucs_device)
+                                       model=demucs_model, device=demucs_device,
+                                       overlap=args.demucs_overlap)
                     print(f"[OK] {filename} | demucs={args.demucs_model} (stem voz)")
                 else:
                     pct = clean_audio(str(f), str(out_path),
