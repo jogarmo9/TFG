@@ -7,29 +7,25 @@ from scipy.signal import butter, filtfilt
 from numpy.fft import rfft, irfft
 import os
 from pathlib import Path
+import shutil
 
+# =====================================================================
+# 1. FORZAR CONTEXTO DE HARDWARE GLOBAL EN WINDOWS (DIRECTML)
+# =====================================================================
+os.environ["TORCHAUDIO_USE_BACKEND"] = "soundfile"
+os.environ["ORT_ENABLE_MODULE_INITIALIZERS"] = "1"
+
+import torch
 
 def _select_torch_device(tag: str = ""):
-    """Devuelve (device, kind) con prioridad CUDA > DirectML > CPU.
-
-    kind in {'cuda','dml','cpu'}. Captura Exception (no solo ImportError):
-    la init de torch_directml puede fallar en runtime por DLL/driver ausentes.
-    """
-    import torch
+    """Devuelve (device, kind) con prioridad CUDA > CPU para módulos PyTorch estándar."""
     if torch.cuda.is_available():
         if tag:
             print(f"[{tag}] CUDA disponible — usando GPU NVIDIA")
         return torch.device("cuda"), "cuda"
-    try:
-        import torch_directml
-        dev = torch_directml.device()
-        if tag:
-            print(f"[{tag}] torch-directml disponible — usando GPU AMD/Intel")
-        return dev, "dml"
-    except Exception:
-        if tag:
-            print(f"[{tag}] sin GPU — usando CPU")
-        return torch.device("cpu"), "cpu"
+    if tag:
+        print(f"[{tag}] sin GPU NVIDIA — usando CPU para este módulo")
+    return torch.device("cpu"), "cpu"
 
 
 def _declip_pass(audio, clip_thresh):
@@ -42,7 +38,6 @@ def _declip_pass(audio, clip_thresh):
 
         if len(idx_clean) > 10:
             cs = CubicSpline(idx_clean, audio[idx_clean])
-
             audio = audio.copy()
             audio[mask] = np.clip(cs(idx[mask]), -1.0, 1.0)
 
@@ -50,14 +45,11 @@ def _declip_pass(audio, clip_thresh):
 
 
 def _wiener_pass(audio, nr_strength, hop=256, win=2048):
-
     frames = []
     mags = []
 
     for i in range(0, len(audio) - win, hop):
-
         spec = rfft(audio[i:i + win] * np.hanning(win))
-
         mags.append(np.abs(spec))
         frames.append((i, spec))
 
@@ -65,25 +57,14 @@ def _wiener_pass(audio, nr_strength, hop=256, win=2048):
         return audio
 
     noise = np.percentile(mags, 15, axis=0)
-
     out = np.zeros(len(audio))
     cnt = np.zeros(len(audio))
-
     w = np.hanning(win)
 
     for i, spec in frames:
-
         mag = np.abs(spec)
-
-        gain = np.maximum(
-            0,
-            (mag - nr_strength * noise) / (mag + 1e-8)
-        )
-
-        cleaned = irfft(
-            gain * mag * np.exp(1j * np.angle(spec))
-        )
-
+        gain = np.maximum(0, (mag - nr_strength * noise) / (mag + 1e-8))
+        cleaned = irfft(gain * mag * np.exp(1j * np.angle(spec)))
         out[i:i + win] += cleaned * w
         cnt[i:i + win] += w
 
@@ -96,11 +77,6 @@ def remove_impulses(audio: np.ndarray,
                     passes: int = 2,
                     kernel_size_p2: int = 15,
                     threshold_sigma_p2: float = 1.5) -> np.ndarray:
-    """Elimina impulsos (clicks/crispeos) por filtro mediana.
-
-    P1 (global RMS): detecta picos grandes.
-    P2+ (global RMS, parametros independientes): captura residuos mas finos.
-    """
     from scipy.signal import medfilt as _medfilt
 
     a = audio.astype(np.float32)
@@ -114,7 +90,7 @@ def remove_impulses(audio: np.ndarray,
     a    = a.copy()
     a[mask] = med[mask]
 
-    # Pasadas adicionales con parametros P2
+    # Pasadas adicionales con parámetros P2
     for _ in range(passes - 1):
         rms2  = float(np.sqrt(np.mean(a ** 2)))
         med2  = _medfilt(a.astype(np.float64), kernel_size=kernel_size_p2).astype(np.float32)
@@ -125,26 +101,17 @@ def remove_impulses(audio: np.ndarray,
 
 
 def _load_dfn3_model():
-    """Carga modelo DFN3 una sola vez. Usa CUDA si disponible."""
-    import torch
+    """Carga modelo DFN3 una sola vez (Usa CUDA si está disponible, si no CPU)."""
     from df.enhance import init_df
     model, df_state, _ = init_df()
-    if torch.cuda.is_available():
-        model = model.to("cuda")
-        print("[DFN3] CUDA disponible — modelo en GPU")
-    else:
-        print("[DFN3] CUDA no disponible — usando CPU")
+    device, kind = _select_torch_device("DFN3")
+    if kind != "cpu":
+        model = model.to(device)
     return model, df_state
 
 
 def clean_audio_dfn3(path_in: str, path_out: str, atten_lim_db: float = 75.0,
                      model=None, df_state=None):
-    """Limpia audio con DeepFilterNet3. Salida: WAV mono 16kHz PCM_16.
-
-    atten_lim_db: máximo dB de supresión (75 = default, 100 = sin límite).
-    model/df_state: pasar para reusar modelo ya cargado (evita recarga por fichero).
-    """
-    import torch
     import soundfile as sf
     import librosa
     from df.enhance import enhance, init_df, load_audio
@@ -154,8 +121,11 @@ def clean_audio_dfn3(path_in: str, path_out: str, atten_lim_db: float = 75.0,
 
     os.makedirs(os.path.dirname(path_out) or ".", exist_ok=True)
     audio, _ = load_audio(path_in, sr=df_state.sr())
-    if torch.cuda.is_available():
-        audio = audio.to("cuda")
+    
+    device, kind = _select_torch_device()
+    if kind != "cpu":
+        audio = audio.to(device)
+        
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*sinc_interpolation.*", category=UserWarning)
         enhanced = enhance(model, df_state, audio, atten_lim_db=atten_lim_db)
@@ -165,248 +135,220 @@ def clean_audio_dfn3(path_in: str, path_out: str, atten_lim_db: float = 75.0,
     sf.write(path_out, arr, 16_000, subtype="PCM_16")
 
 
+# =====================================================================
+# 2. MOTOR DEMUCS CONFIGURATION PREPARATION
+# =====================================================================
+
+def _select_demucs_device():
+    """Detecta el mejor proveedor de ejecución para audio-separator (ONNX Runtime).
+    Prioridad: CUDA > DirectML > CPU"""
+    try:
+        import onnxruntime as ort
+        available = ort.get_available_providers()
+        if "CUDAExecutionProvider" in available:
+            print("[DEMUCS] CUDA disponible — usando GPU NVIDIA (ONNX CUDA)")
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"], "cuda"
+        if "DmlExecutionProvider" in available:
+            print("[DEMUCS] DirectML disponible — usando GPU (DirectML)")
+            return ["DmlExecutionProvider", "CPUExecutionProvider"], "dml"
+    except ImportError:
+        pass
+    print("[DEMUCS] Sin GPU detectada — usando CPU")
+    return ["CPUExecutionProvider"], "cpu"
+
+
 def _load_demucs_model(model_name: str = "htdemucs"):
-    """Carga modelo Demucs una sola vez.
-
-    Prioridad de dispositivo: CUDA (NVIDIA) > DirectML (AMD/Intel en Windows) > CPU.
-    model_name: 'htdemucs' (default) o 'htdemucs_ft' (mejor calidad, ~4x mas lento).
-    Devuelve (model, device_str).
-    """
-    from demucs.pretrained import get_model
-    model = get_model(model_name)
-    model.eval()
-
-    device, _kind = _select_torch_device("DEMUCS")
-    model.to(device)
-    print(f"[DEMUCS] modelo={model_name} | device={device} | stems={model.sources}")
-    return model, device
+    """Prepara el nombre del archivo de configuración del modelo Demucs
+    y detecta el dispositivo disponible para ONNX Runtime."""
+    model_filename = "htdemucs_ft.yaml" if model_name == "htdemucs_ft" else "htdemucs.yaml"
+    providers, device_kind = _select_demucs_device()
+    print(f"[DEMUCS] Modelo: '{model_filename}' | Dispositivo ONNX: {device_kind} | Providers: {providers}")
+    return model_filename, device_kind, providers
 
 
-def clean_audio_demucs(path_in: str, path_out: str, model, device: str = "cpu",
-                       overlap: float = 0.25):
-    """Extrae el stem de voz con Demucs. Salida: WAV mono 16kHz PCM_16.
-
-    Demucs es un separador de fuentes (no un denoiser): aísla la voz de la mezcla.
-    En chunks sin voz el stem queda casi en silencio → evita FP de Speech en YOLO.
-
-    model/device: pasar para reusar modelo ya cargado (evita recarga por fichero).
-    """
-    import torch
-    import soundfile as sf
-    import librosa
-    from demucs.apply import apply_model
-
-    os.makedirs(os.path.dirname(path_out) or ".", exist_ok=True)
-
-    # 1) Cargar WAV crudo 16 kHz mono
-    audio, _ = librosa.load(path_in, sr=16_000, mono=True)
-
-    # 2) Resamplear a la SR del modelo (44100) y duplicar a estéreo (Demucs espera 2 canales)
-    model_sr = model.samplerate
-    audio_rs = librosa.resample(audio, orig_sr=16_000, target_sr=model_sr,
-                                res_type='kaiser_best')
-    wav = torch.from_numpy(audio_rs).float().unsqueeze(0)              # (1, samples)
-    wav = wav.repeat(model.audio_channels, 1)                         # (channels, samples)
-
-    # 3) Normalizar (igual que el preprocesado interno de Demucs), separar, desnormalizar
-    ref = wav.mean(0)
-    mean, std = ref.mean(), ref.std()
-    wav = (wav - mean) / (std + 1e-8)
-    with torch.no_grad():
-        sources = apply_model(model, wav[None].to(device), device=device,
-                              split=True, overlap=overlap, progress=False)[0]
-    sources = sources * std + mean                                   # (stems, channels, samples)
-
-    # 4) Stem de voz → mono
-    vocals = sources[model.sources.index("vocals")].mean(0).cpu().numpy()
-
-    # 5) Resamplear de vuelta a 16 kHz y guardar PCM_16
-    if model_sr != 16_000:
-        vocals = librosa.resample(vocals, orig_sr=model_sr, target_sr=16_000,
-                                  res_type='kaiser_best')
-    sf.write(path_out, vocals, 16_000, subtype="PCM_16")
-
-
-def clean_audio(path_in,
-                path_out,
-                clip_thresh=0.85,
-                nr_strength=0.85,
-                lp_cutoff=7500,
-                hp_cutoff=None,
-                passes=2,
-                impulse_removal=False,
-                impulse_kernel=11,
-                impulse_threshold=2.5,
-                impulse_passes=2,
-                hpss_kernel=0):
-
-    # =========================
-    # CARGA SEGURA DEL WAV
-    # =========================
+def clean_audio(path_in, path_out, clip_thresh=0.85, nr_strength=0.85, lp_cutoff=7500,
+                hp_cutoff=None, passes=2, impulse_removal=False, impulse_kernel=11,
+                impulse_threshold=2.5, impulse_passes=2, hpss_kernel=0):
 
     try:
         sr, data = wavfile.read(path_in)
-
     except Exception as e:
-        raise ValueError(
-            f"No se pudo leer el WAV '{path_in}': {e}"
-        )
-
-    # =========================
-    # NORMALIZACION
-    # =========================
+        raise ValueError(f"No se pudo leer el WAV '{path_in}': {e}")
 
     stereo = data.ndim == 2
-
-    channels = (
-        [data[:, i] for i in range(data.shape[1])]
-        if stereo
-        else [data]
-    )
-
+    channels = [data[:, i] for i in range(data.shape[1])] if stereo else [data]
     results = []
 
     for ch in channels:
-
         audio = ch.astype(np.float32) / 32768.0
-
         pct_total = 0.0
 
         for p in range(passes):
-
-            # =========================
-            # FASE 1: DECLIP
-            # =========================
-
             thresh = clip_thresh - p * 0.03
-
             audio, pct = _declip_pass(audio, thresh)
 
             if p == 0:
                 pct_total = pct
 
-            # =========================
-            # FASE 2: ANTI-IMPULSO (opcional)
-            # =========================
-
             if impulse_removal and p == 0:
-                audio = remove_impulses(audio,
-                                        kernel_size=impulse_kernel,
-                                        threshold_sigma=impulse_threshold,
-                                        passes=impulse_passes)
-
-            # =========================
-            # FASE 3: WIENER
-            # =========================
+                audio = remove_impulses(audio, kernel_size=impulse_kernel,
+                                        threshold_sigma=impulse_threshold, passes=impulse_passes)
 
             audio = _wiener_pass(audio, nr_strength)
-
-        # =========================
-        # FASE 3: HIGHPASS (opcional, elimina rumble <hp_cutoff Hz)
-        # =========================
 
         if hp_cutoff is not None:
             b, a = butter(4, hp_cutoff / (sr / 2), btype='high')
             audio = filtfilt(b, a, audio)
 
-        # =========================
-        # FASE 4: LOWPASS FINAL
-        # =========================
-
         lp_norm = min(lp_cutoff, sr / 2 - 1) / (sr / 2)
         b, a = butter(4, lp_norm, btype='low')
-
         audio = filtfilt(b, a, audio)
 
-        # =========================
-        # FASE 5: HPSS ARMÓNICO (opcional)
-        # Aplicado sobre el archivo completo → sin artefactos de borde.
-        # Elimina componente percusiva (crispeos, impulsos) que causa FP
-        # en Ring Tone y Vibrating. Solo para clases != Speech (pass 1 Wiener).
-        # =========================
         if hpss_kernel > 0:
             import librosa as _lb
             _N_FFT, _HOP = 2048, 256
             D = _lb.stft(audio, n_fft=_N_FFT, hop_length=_HOP, win_length=_N_FFT)
             D_harm, _ = _lb.decompose.hpss(D, kernel_size=hpss_kernel)
-            audio = _lb.istft(D_harm, hop_length=_HOP, win_length=_N_FFT,
-                              length=len(audio))
+            audio = _lb.istft(D_harm, hop_length=_HOP, win_length=_N_FFT, length=len(audio))
 
-        results.append((
-            np.clip(audio, -1, 1),
-            pct_total
-        ))
+        results.append((np.clip(audio, -1, 1), pct_total))
 
-    # =========================
-    # RECONSTRUIR OUTPUT
-    # =========================
-
-    out_data = (
-        np.stack([r[0] for r in results], axis=1)
-        if stereo
-        else results[0][0]
-    )
-
-    # =========================
-    # CREAR CARPETA DESTINO
-    # =========================
-
-    os.makedirs(
-        os.path.dirname(path_out),
-        exist_ok=True
-    )
-
-    # =========================
-    # GUARDAR WAV
-    # =========================
-
-    wavfile.write(
-        path_out,
-        sr,
-        (out_data * 32767).astype(np.int16)
-    )
-
+    out_data = np.stack([r[0] for r in results], axis=1) if stereo else results[0][0]
+    os.makedirs(os.path.dirname(path_out), exist_ok=True)
+    wavfile.write(path_out, sr, (out_data * 32767).astype(np.int16))
     return results[0][1]
 
 
-if __name__ == "__main__":
+# =====================================================================
+# GLOBAL CACHE FOR PROCESS WORKERS (ProcessPoolExecutor)
+# =====================================================================
+_GLOBAL_SEPARATOR = None
+_GLOBAL_DFN3_MODEL = None
+_GLOBAL_DFN3_STATE = None
 
+def process_file_worker(f, clean_dir, args, demucs_config, demucs_device, demucs_providers):
+    global _GLOBAL_SEPARATOR, _GLOBAL_DFN3_MODEL, _GLOBAL_DFN3_STATE
+    import multiprocessing
+    import os
+    from pathlib import Path
+
+    proc_id = multiprocessing.current_process().pid
+    filename = f.name
+    out_path = clean_dir / filename
+
+    try:
+        if args.method == "dfn3":
+            if _GLOBAL_DFN3_MODEL is None:
+                print(f"[PROC-{proc_id}] Inicializando DeepFilterNet3...")
+                _GLOBAL_DFN3_MODEL, _GLOBAL_DFN3_STATE = _load_dfn3_model()
+            
+            clean_audio_dfn3(str(f), str(out_path), atten_lim_db=args.atten_lim_db,
+                             model=_GLOBAL_DFN3_MODEL, df_state=_GLOBAL_DFN3_STATE)
+            print(f"[OK] {filename} | atten_lim_db={args.atten_lim_db}")
+
+        elif args.method == "demucs":
+            if _GLOBAL_SEPARATOR is None:
+                print(f"[PROC-{proc_id}] Inicializando Separator — modelo: {demucs_config} | device: {demucs_device}")
+                
+                tmp_dir = clean_dir / f"tmp_onnx_{proc_id}"
+                os.makedirs(tmp_dir, exist_ok=True)
+                
+                root_dir = Path(__file__).parent.parent
+                model_dir = root_dir / "data" / "models"
+                os.makedirs(model_dir, exist_ok=True)
+                
+                from audio_separator.separator import Separator
+
+                # Construir kwargs según el dispositivo detectado
+                sep_kwargs = dict(
+                    model_file_dir=str(model_dir),
+                    output_dir=str(tmp_dir),
+                    output_format="WAV",
+                    normalization_threshold=1.0,
+                    output_single_stem="vocals",
+                    demucs_params={
+                        "segment_size": "Default",
+                        "shifts": 2,
+                        "overlap": args.demucs_overlap,
+                        "segments_enabled": True,
+                    },
+                )
+
+                # Activar aceleración según lo detectado en el proceso principal
+                if demucs_device == "dml":
+                    sep_kwargs["use_directml"] = True
+                elif demucs_device == "cuda":
+                    sep_kwargs["use_cuda"] = True
+                # CPU: no se añade ningún flag extra
+
+                separator_instance = Separator(**sep_kwargs)
+
+                # Forzar providers ONNX explícitamente (garantiza que se usa la GPU)
+                separator_instance.execution_providers = demucs_providers
+                separator_instance.hardware_acceleration_enabled = (demucs_device != "cpu")
+
+                separator_instance.load_model(model_filename=demucs_config)
+                _GLOBAL_SEPARATOR = separator_instance
+
+            separator = _GLOBAL_SEPARATOR
+            tmp_dir = Path(separator.output_dir)
+
+            output_files = separator.separate(str(f))
+            if output_files and len(output_files) > 0:
+                file_generado = tmp_dir / output_files[0]
+                import soundfile as sf
+                import librosa
+                audio_vocals, _ = librosa.load(file_generado, sr=16_000, mono=True)
+                sf.write(str(out_path), audio_vocals, 16_000, subtype="PCM_16")
+                try:
+                    file_generado.unlink()
+                except Exception:
+                    pass
+                print(f"[OK] {filename} | demucs_model={args.demucs_model} (Aceleración DirectML GPU)")
+            else:
+                raise RuntimeError(f"El motor Demucs no pudo procesar el archivo: {filename}")
+
+        else: # wiener
+            pct = clean_audio(str(f), str(out_path),
+                              passes=args.passes,
+                              impulse_removal=args.impulse_removal,
+                              impulse_kernel=args.impulse_kernel,
+                              impulse_threshold=args.impulse_threshold,
+                              impulse_passes=args.impulse_passes,
+                              hpss_kernel=args.hpss_kernel)
+            hpss_note = f" + HPSS k={args.hpss_kernel}" if args.hpss_kernel else ""
+            print(f"[OK] {filename} | clipping: {pct:.2f}%{hpss_note}")
+        
+        return True
+    except Exception as e:
+        print(f"[ERROR] {filename}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+if __name__ == "__main__":
+    import concurrent.futures
     _ROOT = Path(__file__).parent.parent
 
-    parser = argparse.ArgumentParser(description="Limpia audios WAV con filtro Wiener + declipping o DeepFilterNet3")
-    parser.add_argument("--method", choices=["wiener", "dfn3", "demucs"], default="wiener",
-                        help="Método de limpieza: 'wiener' (default), 'dfn3' (DeepFilterNet3) "
-                             "o 'demucs' (separación de voz, stem vocals)")
-    parser.add_argument("--demucs-model", default="htdemucs",
-                        choices=["htdemucs", "htdemucs_ft"],
-                        help="Modelo Demucs: 'htdemucs' (default) o 'htdemucs_ft' (mejor, más lento)")
-    parser.add_argument("--demucs-overlap", type=float, default=0.25,
-                        help="Solape entre segmentos Demucs (default 0.25). 0.1 = ~25%% mas rapido, "
-                             "perdida minima de calidad.")
-    parser.add_argument("--passes", type=int, default=2, help="Pasadas Wiener (default: 2, ignorado en dfn3)")
-    parser.add_argument("--impulse-removal", action="store_true",
-                        help="Aplica remove_impulses antes de Wiener (elimina clicks/crispeos)")
+    parser = argparse.ArgumentParser(description="Limpia audios WAV con filtro Wiener, DeepFilterNet3 o Demucs ONNX")
+    parser.add_argument("--method", choices=["wiener", "dfn3", "demucs"], default="wiener")
+    parser.add_argument("--demucs-model", default="htdemucs", choices=["htdemucs", "htdemucs_ft"])
+    parser.add_argument("--demucs-overlap", type=float, default=0.25)
+    parser.add_argument("--passes", type=int, default=2)
+    parser.add_argument("--impulse-removal", action="store_true")
     parser.add_argument("--impulse-kernel", type=int, default=11)
     parser.add_argument("--impulse-threshold", type=float, default=2.5)
     parser.add_argument("--impulse-passes", type=int, default=2)
-    parser.add_argument("--hpss-kernel", type=int, default=0,
-                        help="HPSS harmónico: kernel size (0=desactivado). "
-                             "Recomendado 61 para Wiener pass 1 (clases != Speech).")
-    parser.add_argument("--atten-lim-db", type=float, default=75.0,
-                        help="DFN3: máximo dB de supresión (default: 75.0)")
-    parser.add_argument("--date-from", default=None,
-                        help="Procesar solo archivos desde esta fecha (formato YYYYMMDD, inclusive)")
-    parser.add_argument("--date-to", default=None,
-                        help="Procesar solo archivos hasta esta fecha (formato YYYYMMDD, inclusive)")
-    parser.add_argument("--reprocess-all", action="store_true",
-                        help="Reprocesa todos los archivos aunque ya existan en clean-dir")
-    parser.add_argument("--audios-dir", default=str(_ROOT / "data" / "audios"),
-                        help="Carpeta con WAVs de entrada (default: data/audios)")
-    parser.add_argument("--clean-dir", default=None,
-                        help="Carpeta de salida (default: data/clean para wiener, data/clean_dfn para dfn3)")
-    parser.add_argument("--file-list", default=None,
-                        help="Procesar solo los WAVs nombrados en este fichero (uno por linea). "
-                             "Para limpiar solo el subconjunto de candidatos Speech.")
+    parser.add_argument("--hpss-kernel", type=int, default=0)
+    parser.add_argument("--atten-lim-db", type=float, default=75.0)
+    parser.add_argument("--date-from", default=None)
+    parser.add_argument("--date-to", default=None)
+    parser.add_argument("--reprocess-all", action="store_true")
+    parser.add_argument("--audios-dir", default=str(_ROOT / "data" / "audios"))
+    parser.add_argument("--clean-dir", default=None)
+    parser.add_argument("--file-list", default=None)
+    parser.add_argument("--workers", type=int, default=4, help="Número de hilos/procesos en paralelo")
     args = parser.parse_args()
 
     audios_dir = Path(args.audios_dir)
@@ -436,33 +378,20 @@ if __name__ == "__main__":
 
     if not wavs:
         print(f"No se encontraron archivos .wav en {audios_dir}/")
-
     else:
-
         print(f"[INFO] Método: {args.method.upper()} | Salida: {clean_dir}/")
-        ok = 0
-        fail = 0
+        
+        active_wavs = []
         skipped = 0
-
-        # Carga DFN3 una sola vez antes del loop
-        dfn3_model = dfn3_state = None
-        if args.method == "dfn3":
-            dfn3_model, dfn3_state = _load_dfn3_model()
-
-        # Carga Demucs una sola vez antes del loop
-        demucs_model = demucs_device = None
-        if args.method == "demucs":
-            demucs_model, demucs_device = _load_demucs_model(args.demucs_model)
-
-        date_from = args.date_from  # e.g. "20260311"
-        date_to   = args.date_to    # e.g. "20260424"
+        fail = 0
+        
+        date_from = args.date_from
+        date_to   = args.date_to
 
         for f in wavs:
-
             filename = f.name
             out_path = clean_dir / filename
 
-            # Filter by date embedded in filename (YYYYMMDD_...)
             file_date = filename[:8]
             if file_date.isdigit():
                 if date_from and file_date < date_from:
@@ -482,34 +411,43 @@ if __name__ == "__main__":
                 fail += 1
                 continue
 
-            try:
-                if args.method == "dfn3":
-                    clean_audio_dfn3(str(f), str(out_path), atten_lim_db=args.atten_lim_db,
-                                     model=dfn3_model, df_state=dfn3_state)
-                    print(f"[OK] {filename} | atten_lim_db={args.atten_lim_db}")
-                elif args.method == "demucs":
-                    clean_audio_demucs(str(f), str(out_path),
-                                       model=demucs_model, device=demucs_device,
-                                       overlap=args.demucs_overlap)
-                    print(f"[OK] {filename} | demucs={args.demucs_model} (stem voz)")
-                else:
-                    pct = clean_audio(str(f), str(out_path),
-                                      passes=args.passes,
-                                      impulse_removal=args.impulse_removal,
-                                      impulse_kernel=args.impulse_kernel,
-                                      impulse_threshold=args.impulse_threshold,
-                                      impulse_passes=args.impulse_passes,
-                                      hpss_kernel=args.hpss_kernel)
-                    hpss_note = f" + HPSS k={args.hpss_kernel}" if args.hpss_kernel else ""
-                    print(f"[OK] {filename} | clipping: {pct:.2f}%{hpss_note}")
-                ok += 1
+            active_wavs.append(f)
 
-            except Exception as e:
+        demucs_config = demucs_device = demucs_providers = None
+        if args.method == "demucs":
+            demucs_config, demucs_device, demucs_providers = _load_demucs_model(args.demucs_model)
 
-                print(f"[ERROR] {filename}")
-                print(e)
+        ok = 0
 
-                fail += 1
+        if active_wavs:
+            # Demucs con GPU (DirectML/CUDA) no es seguro en multiproceso en Windows:
+            # el contexto ONNX/DirectML debe vivir en un único proceso.
+            effective_workers = 1 if args.method == "demucs" else args.workers
+            if args.method == "demucs" and args.workers > 1:
+                print(f"[INFO] Demucs: forzando 1 proceso (GPU ONNX no es multiproceso-safe en Windows)")
+            print(f"[INFO] Procesando {len(active_wavs)} archivos con {effective_workers} proceso(s) en paralelo...")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=effective_workers) as executor:
+                future_to_file = {
+                    executor.submit(
+                        process_file_worker, f, clean_dir, args,
+                        demucs_config, demucs_device, demucs_providers
+                    ): f
+                    for f in active_wavs
+                }
+                for future in concurrent.futures.as_completed(future_to_file):
+                    f = future_to_file[future]
+                    if future.result():
+                        ok += 1
+                    else:
+                        fail += 1
+        
+        # Limpieza final de carpetas temporales de hilos/procesos
+        for p in clean_dir.glob("tmp_onnx_*"):
+            if p.is_dir():
+                try:
+                    shutil.rmtree(p)
+                except Exception:
+                    pass
 
         print("\n=========================")
         print(f"Procesados correctamente: {ok}")
