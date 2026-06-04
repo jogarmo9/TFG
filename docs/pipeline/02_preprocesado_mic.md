@@ -95,7 +95,7 @@ Prioridad: **CUDA** (NVIDIA) > **DirectML** (GPU AMD/Intel en Windows, `pip inst
 - CPU: ~10 s por fichero de 5 s
 - GPU: sustancialmente más rápido
 
-### Ejecución
+### Ejecución — lote completo
 ```bash
 # Requiere .venv311
 .venv311\Scripts\python.exe scripts/clean_audio.py --method demucs --reprocess-all
@@ -105,6 +105,26 @@ Prioridad: **CUDA** (NVIDIA) > **DirectML** (GPU AMD/Intel en Windows, `pip inst
 
 # Solo un rango de fechas (recomendado para validar antes del lote completo)
 .venv311\Scripts\python.exe scripts/clean_audio.py --method demucs --date-from 20260414 --date-to 20260414
+```
+
+### Ejecución — solo candidatos Speech (modo acelerado con prefiltro VAD)
+
+Demucs es lento (~10 s/fichero en CPU). Con el prefiltro se reduce el lote a los WAVs con voz probable (~30–50% del dataset). Ver workflow completo en [03_inferencia_mic.md §3.4](03_inferencia_mic.md).
+
+```bash
+# Paso 0: generar data/clean_cand/ (Wiener sin HPSS, rápido, solo una vez)
+python scripts/clean_audio.py --method wiener --impulse-removal ^
+  --clean-dir data/clean_cand --reprocess-all
+
+# Paso 1A: puntuar con silero-vad (pesado, una vez)
+.venv311\Scripts\python.exe scripts/vad_candidates.py score --in-dir data/clean_cand
+
+# Paso 1B: elegir umbral y volcar lista de candidatos
+.venv311\Scripts\python.exe scripts/vad_candidates.py select --threshold 0.5
+
+# Paso 2: Demucs SOLO sobre candidatos
+.venv311\Scripts\python.exe scripts/clean_audio.py --method demucs ^
+  --file-list data/processed/speech_candidates.txt --reprocess-all
 ```
 
 ---

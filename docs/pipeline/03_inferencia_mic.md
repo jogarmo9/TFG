@@ -134,7 +134,100 @@ session = ort.InferenceSession(model_path, providers=providers)
 
 ---
 
-## 3.4 Mecanismo de skip/resume
+## 3.4 Workflow completo con prefiltro VAD (método recomendado)
+
+Demucs sobre todo el dataset es lento. El prefiltro descarta WAVs sin voz real antes de lanzar Demucs, reduciendo el lote a ~30–50% del total.
+
+### ¿Qué es `data/clean_cand/`?
+
+Wiener aplicado **sin HPSS** sobre todos los WAVs brutos. Es el audio de entrada al prefiltro: lo suficientemente limpio para que silero-vad detecte voz, lo suficientemente rápido de generar (sin el paso HPSS). Solo se genera una vez.
+
+```bash
+python scripts/clean_audio.py --method wiener --impulse-removal ^
+  --clean-dir data/clean_cand --reprocess-all
+```
+
+---
+
+### Opción A — Prefiltro silero-vad (recomendado)
+
+silero-vad está entrenado para detectar voz humana real; no dispara con ruido de motor/tráfico. Al contrario que YOLO-Speech sobre Wiener, no confunde armónicos residuales con voz → selección más limpia.
+
+**Script:** `scripts/vad_candidates.py`  
+**Salidas:** `data/processed/speech_vad_scores.csv`, `data/processed/speech_candidates.txt`
+
+```bash
+# 1. Puntuar todos los WAVs (pesado, una sola vez — crea speech_vad_scores.csv)
+.venv311\Scripts\python.exe scripts/vad_candidates.py score --in-dir data/clean_cand
+
+# 2. Ver barrido de umbrales y elegir (instantáneo desde cache)
+.venv311\Scripts\python.exe scripts/vad_candidates.py select --threshold 0.5
+#    Imprime tabla: umbral | candidatos | % dataset
+#    threshold=0.5 → típicamente 30–50% del dataset
+
+# 3. Demucs solo sobre candidatos (requiere .venv311)
+.venv311\Scripts\python.exe scripts/clean_audio.py --method demucs ^
+  --file-list data/processed/speech_candidates.txt --reprocess-all
+
+# 4. Inferencia dual-clean, pass 2 solo sobre candidatos
+python scripts/infer_clean.py --dual-clean --use-candidates
+```
+
+Parámetros de `vad_candidates.py`:
+
+| Subcomando | Flag | Default | Descripción |
+|------------|------|---------|-------------|
+| `score` | `--in-dir` | `data/clean_cand` | Carpeta de WAVs a puntuar |
+| `score` | `--scores-csv` | `data/processed/speech_vad_scores.csv` | CSV de salida |
+| `select` | `--threshold` | `0.5` | Umbral `max_prob` silero para marcar candidato |
+| `select` | `--out` | `data/processed/speech_candidates.txt` | Lista de candidatos |
+
+---
+
+### Opción B — Prefiltro YOLO-Speech sobre clean_cand
+
+Usa el propio YOLO para detectar ficheros que disparan la clase Speech sobre el audio Wiener-sin-HPSS. Más rápido de preparar que silero (no necesita `vad_candidates.py score`), pero puede incluir FP por ruido musical.
+
+```bash
+# 1. YOLO prefiltro → speech_candidates.txt
+python scripts/infer_clean.py --build-candidates ^
+  --cand-dir data/clean_cand --cand-conf 0.06
+
+# 2. Demucs solo sobre candidatos
+.venv311\Scripts\python.exe scripts/clean_audio.py --method demucs ^
+  --file-list data/processed/speech_candidates.txt --reprocess-all
+
+# 3. Inferencia dual-clean, pass 2 solo sobre candidatos
+python scripts/infer_clean.py --dual-clean --use-candidates
+```
+
+`--cand-conf 0.06`: umbral bajo a propósito — recall alto, no importa que incluya algo de ruido porque Demucs filtrará.
+
+---
+
+### Comparativa de prefiltros
+
+| | silero-vad (Opción A) | YOLO-speech (Opción B) |
+|---|---|---|
+| Precision | Alta (no dispara con tráfico) | Media (FP por ruido musical) |
+| Candidatos seleccionados | ~30–50% | ~62% |
+| Paso previo pesado | `vad_candidates.py score` (una vez) | ninguno |
+| Requiere `.venv311` en prefiltro | Sí (silero) | No (YOLO ONNX) |
+
+---
+
+### Flags relevantes de `infer_clean.py`
+
+| Flag | Descripción |
+|------|-------------|
+| `--build-candidates` | Etapa B: YOLO sobre `--cand-dir` → `speech_candidates.txt` (no escribe CSV final) |
+| `--cand-dir` | Carpeta de entrada para `--build-candidates` (default: `data/clean_cand`) |
+| `--cand-conf` | Umbral de confianza del prefiltro YOLO (default: 0.06) |
+| `--use-candidates` | En `--dual-clean`: limita el pass 2 a los ficheros en `speech_candidates.txt` |
+
+---
+
+## 3.6 Mecanismo de skip/resume
 
 Sin `--reprocess-all`: el script lee los `source_file` ya presentes en `predicciones_clean.csv` y salta los WAVs ya procesados. Modo append.
 
@@ -142,7 +235,7 @@ Con `--reprocess-all`: sobreescribe el CSV completo.
 
 ---
 
-## 3.5 Formato de salida (CSV)
+## 3.7 Formato de salida (CSV)
 
 ```
 mic_id, timestamp_onset, timestamp_offset, class_id, confidence, source_file, session_id, source
@@ -161,7 +254,7 @@ mic_id, timestamp_onset, timestamp_offset, class_id, confidence, source_file, se
 
 ---
 
-## 3.6 Parámetros del modelo (fijos, deben coincidir con entrenamiento)
+## 3.8 Parámetros del modelo (fijos, deben coincidir con entrenamiento)
 
 | Parámetro | Valor |
 |-----------|-------|

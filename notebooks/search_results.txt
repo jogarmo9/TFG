@@ -1,0 +1,551 @@
+
+================================================================================
+NOTEBOOK: 01_dfn3_speech_tuning.ipynb
+================================================================================
+
+TITLE CELL:
+# Notebook 05 — Validacion preprocesado Mic
+
+**Contexto**: Wiener genera armonicos residuales -> sobredeteccion de Speech.  
+**Pipeline dual propuesto**: Wiener para clases != Speech | DFN3-75 para Speech.
+
+Este notebook valida:
+1. **Speech**: DFN3-75 reduce falsos positivos respecto a Wiener
+2. **Otras clases**: como funciona Wiener Mobile -> que se puede mejorar
+
+| Metodo | Uso | Descripcion |
+|--------|-----|-------------|
+| Raw | baseline | Sin procesar |
+| Wiener Mobile | no-Speech | hp=100
+
+FOUND 12 MATCHING CELLS:
+
+[1] cell_id: cell-0
+    cell_type: markdown
+    matched_terms: DFN3, dfn3, Wiener
+    first_10_lines:
+      # Notebook 05 — Validacion preprocesado Mic
+      
+      **Contexto**: Wiener genera armonicos residuales -> sobredeteccion de Speech.  
+      **Pipeline dual propuesto**: Wiener para clases != Speech | DFN3-75 para Speech.
+      
+      Este notebook valida:
+      1. **Speech**: DFN3-75 reduce falsos positivos respecto a Wiener
+      2. **Otras clases**: como funciona Wiener Mobile -> que se puede mejorar
+      
+      | Metodo | Uso | Descripcion |
+
+[2] cell_id: d80c0ca2
+    cell_type: markdown
+    matched_terms: DFN3, dfn3
+    first_10_lines:
+      ## 1. Cargar DFN3 (una sola vez)
+
+[3] cell_id: 9bf2ebcc
+    cell_type: code
+    matched_terms: DFN3, dfn3
+    first_10_lines:
+      import torch
+      from df.enhance import enhance, init_df
+      
+      print('Cargando DFN3...')
+      model, df_state, _ = init_df()
+      DFN_SR = df_state.sr()
+      print(f'DFN3 listo  |  SR interno = {DFN_SR} Hz')
+      
+      def apply_dfn3_inmem(audio_np: np.ndarray, atten_lim_db: float = 20.0) -> np.ndarray:
+          """DFN3 en memoria: numpy@16kHz -> numpy@16kHz, sin archivos temporales."""
+
+[4] cell_id: db724ead
+    cell_type: markdown
+    matched_terms: Wiener
+    first_10_lines:
+      ## 2. Cargar YOLO + helpers mel/NMS/Wiener
+
+[5] cell_id: 6b5f2792
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      import onnxruntime as ort
+      
+      # ── Wiener Mobile ──────────────────────────────────────────────────────────────
+      _HP_B, _HP_A = butter(4, 100  / (SR / 2), btype='high')
+      _LP_B, _LP_A = butter(4, 7999 / (SR / 2), btype='low')
+      
+      def apply_wiener_mobile(chunk: np.ndarray) -> np.ndarray:
+          """hp=100Hz, nr=0.50, x2 passes — parametros optimos del grid search nb04."""
+          a = _wiener_pass(chunk, nr_strength=0.50)
+          a = _wiener_pass(a,     nr_strength=0.50)
+
+[6] cell_id: 71a11af3
+    cell_type: markdown
+    matched_terms: DFN3, dfn3, Wiener
+    first_10_lines:
+      ## 1. Preprocesamiento: Raw / Wiener / DFN3-75
+
+[7] cell_id: 83b55002
+    cell_type: code
+    matched_terms: DFN3, dfn3, Wiener
+    first_10_lines:
+      METHODS = ['Raw', 'Wiener', 'ImpWiener', 'DFN3-75']
+      print(f'Metodos: {METHODS}')
+      print(f'Total inferencias: {N_FRAGMENTS} x {len(METHODS)} = {N_FRAGMENTS*len(METHODS)}')
+      print()
+      
+      processed = {m: [] for m in METHODS}
+      
+      for i, frag in enumerate(fragments):
+          chunk = frag['chunk']
+          fname = frag['path'].name
+
+[8] cell_id: 75172fc0
+    cell_type: code
+    matched_terms: DFN3, dfn3, Wiener
+    first_10_lines:
+      # ── CONFIGURACION ─────────────────────────────────────────
+      VIZ_FRAG_IDX = 5                                # fragmento (0..N_FRAGMENTS-1)
+      VIZ_METHODS  = ['Raw', 'Wiener', 'ImpWiener', 'DFN3-75']  # metodos a comparar
+      # ──────────────────────────────────────────────────────────
+      
+      import librosa.display
+      from IPython.display import display, Audio
+      
+      CLASS_COLORS = plt.cm.tab10(np.linspace(0, 1, len(CLASSES)))
+      frag_info    = fragments[VIZ_FRAG_IDX]
+
+[9] cell_id: 3e6f9bbc
+    cell_type: markdown
+    matched_terms: Wiener
+    first_10_lines:
+      ## 2b. Ruido crispeante residual en Wiener
+      
+      El filtrado Wiener elimina el ruido de fondo pero genera **ruido musical** (artefactos tonales residuales de la substraccion espectral). Aqui exploramos:
+      1. Escuchar varios clips Wiener para confirmar el artefacto
+      2. Identificar en que banda frecuencial vive el crispeo
+      3. Probar parametros mas agresivos para eliminarlo
+
+[10] cell_id: 91e39011
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      # ── CONFIGURACION ─────────────────────────────────────────
+      N_AUDIO        = 6       # clips a reproducir
+      CRACKLE_PASSES = 3       # wiener passes extra (vs 2 actual)
+      CRACKLE_NR     = 0.70    # nr_strength extra (vs 0.50 actual)
+      # ──────────────────────────────────────────────────────────
+      
+      from IPython.display import display, Audio
+      import librosa.display
+      
+      def apply_wiener_aggressive(chunk, nr_strength=CRACKLE_NR, passes=CRACKLE_PASSES):
+
+[11] cell_id: 27d57d40
+    cell_type: markdown
+    matched_terms: Wiener
+    first_10_lines:
+      ### Solucion: filtro mediana anti-impulso + Wiener
+      
+      Los picos son **impulse noise** (broadband, corta duracion) — Wiener no los ve porque trabaja sobre el piso de ruido estacionario (percentil bajo de energia). Un **filtro mediana** detecta muestras que se desvian del contexto local y las sustituye por la mediana de sus vecinos. Pipeline: `raw -> remove_impulses -> wiener`.
+
+[12] cell_id: 112a95fa
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      from scipy.signal import medfilt
+      
+      # ── CONFIGURACION ─────────────────────────────────────────
+      IMPULSE_KERNEL       = 11   # P1: ventana mediana (muestras, impar)
+      IMPULSE_THRESHOLD    = 2.5  # P1: umbral k*RMS — menor = mas agresivo
+      IMPULSE_PASSES       = 2    # numero de pasadas (1 o 2)
+      IMPULSE_KERNEL_P2    = 15   # P2: ventana mayor — mejor contexto post-limpieza
+      IMPULSE_THRESHOLD_P2 = 1.5  # P2: mas sensible — RMS ya estable sin picos grandes
+      RMS_WINDOW           = 512  # Local RMS: ventana en muestras (~32ms a 16kHz)
+      # ──────────────────────────────────────────────────────────
+
+
+================================================================================
+NOTEBOOK: 02_raw_vs_clean_comparison.ipynb
+================================================================================
+
+TITLE CELL:
+# 00 — Comparación Raw vs Procesado por Fuente
+
+Evalúa el impacto del preprocesado sobre las predicciones YOLO, **por separado** para cada pipeline:
+
+| Fuente | Raw | Procesado | Ruido eliminado |
+|--------|-----|-----------|----------------|
+| **Mic fijo** | `data/raw/*.txt` (inferencia sin limpiar) | `predicciones_clean.csv` | Declip + Wiener + Lowpass 7500 Hz |
+| **Móvil** | `predictions_mobile_raw.parquet` (pre-NMS) | `predictions_mobile.parquet` (post-NMS) | NMS IoU 0.7 (Wiener gated ya apl
+
+FOUND 10 MATCHING CELLS:
+
+[1] cell_id: hdr_title
+    cell_type: markdown
+    matched_terms: Wiener
+    first_10_lines:
+      # 00 — Comparación Raw vs Procesado por Fuente
+      
+      Evalúa el impacto del preprocesado sobre las predicciones YOLO, **por separado** para cada pipeline:
+      
+      | Fuente | Raw | Procesado | Ruido eliminado |
+      |--------|-----|-----------|----------------|
+      | **Mic fijo** | `data/raw/*.txt` (inferencia sin limpiar) | `predicciones_clean.csv` | Declip + Wiener + Lowpass 7500 Hz |
+      | **Móvil** | `predictions_mobile_raw.parquet` (pre-NMS) | `predictions_mobile.parquet` (post-NMS) | NMS IoU 0.7 (Wiener gated ya aplicado en ambos) |
+      
+      > **Nota**: las dos pipelines eliminan tipos de ruido distintos y no son comparables entre sí directamente.
+
+[2] cell_id: hdr_part_a
+    cell_type: markdown
+    matched_terms: Wiener
+    first_10_lines:
+      ---
+      ## Parte A — Micrófonos Fijos
+      **Raw**: inferencia directa sobre audio sin procesar (`data/raw/**/predicciones*.txt`)  
+      **Clean**: inferencia sobre audio procesado con Declip + Wiener + Lowpass 7500 Hz (`predicciones_clean.csv`)
+
+[3] cell_id: hdr_part_b
+    cell_type: markdown
+    matched_terms: Wiener
+    first_10_lines:
+      ---
+      ## Parte B — Móvil
+      **Sin Wiener**: inferencia sobre audio crudo convertido a WAV 16kHz, sin filtrado (`predictions_mobile_noWiener.parquet`)  
+      **Wiener Gated**: inferencia sobre audio filtrado SNR-gate 8dB, hp=100Hz, nr=0.50, ×2 (`predictions_mobile.parquet`)
+      
+      Ambos post-NMS IoU ≥ 0.7 → comparación equivalente a Parte A (efecto del filtrado de audio).
+
+[4] cell_id: load_mobile
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      no_wiener_path = DATA_DIR / 'predictions_mobile_noWiener.parquet'
+      proc_mob_path  = DATA_DIR / 'predictions_mobile.parquet'
+      
+      mob_nw_ok   = no_wiener_path.exists()
+      mob_proc_ok = proc_mob_path.exists()
+      
+      if not mob_nw_ok:
+          print(f'[WARN] {no_wiener_path.name} no encontrado — ejecutar scripts/prepare_mobile.py')
+      if not mob_proc_ok:
+          print(f'[WARN] {proc_mob_path.name} no encontrado — ejecutar scripts/prepare_mobile.py')
+
+[5] cell_id: mob_coverage
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      if not (mob_nw_ok and mob_proc_ok):
+          print('Datos móvil no disponibles'); raise SystemExit()
+      
+      all_sessions = sorted(set(mob_nw['session_id'].unique()) | set(mob_proc['session_id'].unique()))
+      df_sess = pd.DataFrame({
+          'Sin Wiener':   mob_nw.groupby('session_id').size(),
+          'Wiener Gated': mob_proc.groupby('session_id').size(),
+      }).reindex(all_sessions).fillna(0).astype(int)
+      df_sess['Δ'] = df_sess['Wiener Gated'] - df_sess['Sin Wiener']
+      df_sess['Δ %'] = (df_sess['Δ'] / df_sess['Sin Wiener'].replace(0, np.nan) * 100).round(1)
+
+[6] cell_id: mob_impact
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      mob_r = mob_nw[mob_nw['session_id'].isin(shared_sessions)].copy()
+      mob_p = mob_proc[mob_proc['session_id'].isin(shared_sessions)].copy()
+      
+      delta = len(mob_p) - len(mob_r)
+      delta_pct = delta / len(mob_r) * 100
+      t_stat, p_val = sp_stats.mannwhitneyu(mob_p['confidence'].dropna(), mob_r['confidence'].dropna(), alternative='two-sided')
+      
+      print(f'=== MÓVIL — {len(shared_sessions)} sesiones compartidas ===')
+      print(f'Sin Wiener   : {len(mob_r):,} eventos | Conf media: {mob_r["confidence"].mean():.4f}')
+      print(f'Wiener Gated : {len(mob_p):,} eventos | Conf media: {mob_p["confidence"].mean():.4f}')
+
+[7] cell_id: mob_classes
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      df_cls_mob = class_delta_table(mob_r, mob_p, label_a='Sin Wiener', label_b='Wiener Gated')
+      display(df_cls_mob)
+      plot_class_delta(df_cls_mob, 'Móvil', 'mob_class_delta.png', label_a='Sin Wiener', label_b='Wiener Gated')
+
+[8] cell_id: mob_confidence
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      plot_confidence(mob_r, mob_p, 'Móvil', 'mob_confidence.png', label_a='Sin Wiener', label_b='Wiener Gated')
+
+[9] cell_id: mob_sessions
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      raw_sess  = mob_r.groupby('session_id')['confidence'].agg(['mean','count']).rename(columns={'mean':'conf_sinW','count':'n_sinW'})
+      proc_sess = mob_p.groupby('session_id')['confidence'].agg(['mean','count']).rename(columns={'mean':'conf_wiener','count':'n_wiener'})
+      sess = pd.concat([raw_sess, proc_sess], axis=1).reindex(sorted(shared_sessions))
+      sess['Δ conf'] = (sess['conf_wiener'] - sess['conf_sinW']).round(4)
+      sess['Δ N %']  = ((sess['n_wiener'] - sess['n_sinW']) / sess['n_sinW'] * 100).round(1)
+      display(sess.rename(columns={
+          'conf_sinW':'Conf Sin Wiener','conf_wiener':'Conf Wiener','n_sinW':'N Sin Wiener','n_wiener':'N Wiener'
+      }))
+      
+      fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+[10] cell_id: summary_cell
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      rows = []
+      
+      if mic_raw_ok and mic_clean_ok:
+          t_stat_mic, p_mic = sp_stats.mannwhitneyu(
+              mic_c['confidence'].dropna(), mic_r['confidence'].dropna(), alternative='two-sided'
+          )
+          rows += [
+              ('Mic — días con datos raw',          mic_raw['date'].nunique()),
+              ('Mic — días con datos clean',         mic_clean['date'].nunique()),
+              ('Mic — días compartidos',             len(shared_mic)),
+
+
+================================================================================
+NOTEBOOK: 03_etl.ipynb
+================================================================================
+
+TITLE CELL:
+# 03 — Validación del ETL
+
+El procesamiento ETL se ejecuta via scripts:
+```bash
+python scripts/prepare_mic.py        # mic fijos → predictions_geo.parquet
+python scripts/prepare_mobile.py     # móvil → predictions_mobile.parquet
+```
+Este notebook valida la calidad del resultado **por trayecto** (no por día):
+- **Mic**: trayecto = día de grabación (micrófono fijo)
+- **Móvil**: trayecto = `session_id` (cada ruta es independiente; fecha extraída del GPX)
+
+---
+
+### Dos conjuntos de datos — cuándo se
+
+NO MATCHES FOUND
+
+
+================================================================================
+NOTEBOOK: 07_validation_listen.ipynb
+================================================================================
+
+TITLE CELL:
+# 07 — Validación rápida: escuchar predicciones + espectrograma YOLO
+
+Para cada predicción muestra el **mel-espectrograma** con la caja temporal superpuesta
+(tal y como lo vería YOLO) y reproduce el **clip de audio** directamente en el notebook.
+
+**Workflow:**
+1. Configura `TARGET_CLASS`, `MIN_CONF`, `N_SHOW` en la celda de configuración.
+2. Ejecuta las celdas. Escucha + mira el espectrograma para cada predicción.
+3. Anota los índices de falsos positivos en `FP_INDICES` de la última celda y ejec
+
+FOUND 11 MATCHING CELLS:
+
+[1] cell_id: cell-imports
+    cell_type: code
+    matched_terms: DFN3, dfn3, clean_dfn, dual-clean, Wiener
+    first_10_lines:
+      import sys, warnings
+      sys.path.insert(0, "../scripts")
+      warnings.filterwarnings("ignore")
+      
+      import numpy as np
+      import pandas as pd
+      import matplotlib.pyplot as plt
+      import matplotlib.patches as mpatches
+      import librosa
+      import pytz
+
+[2] cell_id: cell-helpers
+    cell_type: code
+    matched_terms: DFN3, dfn3, Wiener
+    first_10_lines:
+      import onnxruntime as ort
+      from scipy.signal import medfilt as _medfilt
+      
+      _MODEL_PATH   = Path("../models/YOLOv5n_original.onnx")
+      _YOLO_SESSION = None
+      
+      YOLO_W     = 640
+      PAD_COLS   = 7
+      PAD_VALUE  = 0.447058824
+      IOU_THRESH = 0.7
+
+[3] cell_id: 1e80be20
+    cell_type: markdown
+    matched_terms: DFN3, dfn3
+    first_10_lines:
+      ---
+      ## Sección DFN3 — Test `atten_lim_db` para Speech
+      
+      `atten_lim_db` controla cuánto suprime DFN3 el ruido (dB máx). Valor actual = 75.
+      - **Bajo (40-60)** → supresión conservadora → menos artefactos → puede dejar más ruido
+      - **Alto (80-100)** → supresión agresiva → más artefactos → puede crear FP Speech
+      
+      Cada predicción Speech muestra un panel por valor de `atten_lim_db`, con cajas YOLO.
+      **Requiere `.venv311`** (Python 3.11 + deepfilternet).
+
+[4] cell_id: 56dd690b
+    cell_type: code
+    matched_terms: DFN3, dfn3, clean_dfn
+    first_10_lines:
+      import tempfile, soundfile as sf
+      from clean_audio import clean_audio_dfn3   # requiere Python 3.11 + deepfilternet
+      
+      # ── Configuración ─────────────────────────────────────────────────────────────
+      DFN3_N_SHOW   = 8
+      DFN3_MIN_CONF = 0.10
+      DFN3_SEED     = 42
+      
+      # Valores de atten_lim_db a comparar. 75 = valor actual en pipeline.
+      DFN3_ATTEN_LIMS = [50, 60, 75, 90, 100]
+
+[5] cell_id: 640aba17
+    cell_type: markdown
+    matched_terms: DFN3, dfn3, VAD, vad
+    first_10_lines:
+      ### VAD gate — filtrar chunks sin habla antes de inferir Speech
+      
+      DFN3 genera artefactos en chunks sin voz → YOLO predice Speech FP.
+      Solución: aplicar VAD (Voice Activity Detection) antes de YOLO en pass 2.
+      Si VAD dice "sin voz" → no generar predicciones Speech para ese chunk.
+      
+      Probamos tres métodos de VAD y mostramos su score para cada chunk donde hay Speech predicho.
+
+[6] cell_id: bdfeae3f
+    cell_type: code
+    matched_terms: DFN3, dfn3, VAD, vad
+    first_10_lines:
+      # ── VAD helpers ──────────────────────────────────────────────────────────────
+      
+      def vad_energy(chunk, sr=SR, percentile=85):
+          """Score 0-1 basado en percentil de energía RMS por frames.
+          Alto = energía alta y sostenida (habla). Sin deps nuevas."""
+          frame_len = int(sr * 0.025)   # 25ms
+          hop       = int(sr * 0.010)   # 10ms
+          frames = [chunk[i:i+frame_len] for i in range(0, len(chunk)-frame_len, hop)]
+          if not frames:
+              return 0.0
+
+[7] cell_id: 02da30d6
+    cell_type: markdown
+    matched_terms: DFN3, dfn3, Wiener
+    first_10_lines:
+      ### Alternativa DFN3 — Wiener + armónicos (HPSS) para Speech
+      
+      Compara qué predice YOLO sobre:
+      1. **Wiener** solo (`data/clean/`) — la base limpiada con Wiener sin DFN3
+      2. **Wiener + HPSS armónico** — componente armónica del audio Wiener
+      
+      Si Wiener+HPSS produce menos FP Speech que DFN3, podría sustituirlo en pass 2.
+
+[8] cell_id: 4c8c016c
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      WHPSS_MIN_CONF  = 0.10
+      WHPSS_KERNELS   = [15, 31, 61]
+      
+      # Pipeline de data/clean/ = Declip + Mediana×2(k=11,σ=2.5) + Wiener×2(nr=0.85) + LP7.5kHz
+      WIENER_LABEL = "Med×2+Wiener×2"
+      
+      # ── Buscar TODOS los Speech disponibles ──────────────────────────────────────
+      _all_mic_path = PROCESSED / "predictions_mic.parquet"
+      pred_all_mic_speech = pd.DataFrame()
+      if _all_mic_path.exists():
+
+[9] cell_id: 52d3567d
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      # Wiener pipeline = Declip + Mediana×2(k=11,σ=2.5) + Wiener×2(nr=0.85) + LP7.5kHz
+      WIENER_LABEL = "Med×2+Wiener×2"
+      
+      SEARCH_DATE    = "14-04-2026"
+      SEARCH_UTC_MIN = pd.Timestamp("2026-04-14 14:30:00", tz="UTC")  # 16:30 local CEST
+      SEARCH_UTC_MAX = pd.Timestamp("2026-04-14 16:30:00", tz="UTC")  # 18:30 local CEST
+      SEARCH_CONF    = 0.05
+      
+      _all_path = PROCESSED / "predictions_mic.parquet"
+      if not _all_path.exists():
+
+[10] cell_id: 1b831ea6
+    cell_type: markdown
+    matched_terms: DFN3, dfn3, clean_dfn, Demucs, demucs, dual-clean, clean_demucs
+    first_10_lines:
+      ---
+      ### Solución Speech — DFN3 vs Demucs (separación de voz)
+      
+      DFN3 es un *denoiser*: atenúa el ruido pero deja residuo tonal con ruido intenso → YOLO predice Speech FP.
+      Demucs es un *separador de fuentes*: extrae el stem de **voz**. En chunks sin voz el stem queda casi en silencio → sin FP.
+      
+      Compara para cada predicción Speech el mel + cajas YOLO sobre:
+      1. **DFN3** (`data/clean_dfn/`) — pass 2 actual.
+      2. **Demucs vocals** (`data/clean_demucs/`, o generado al vuelo desde `data/audios/`).
+      
+
+[11] cell_id: 54b63aab
+    cell_type: code
+    matched_terms: DFN3, dfn3, clean_dfn, Demucs, demucs, clean_demucs
+    first_10_lines:
+      # ╔══════════════════════════════════════════════════════════════════════════╗
+      # ║  COMPARACIÓN Speech: DFN3 (denoiser actual)  vs  Demucs (stem de voz)   ║
+      # ║  Para cada predicción Speech: 2 paneles (mel + cajas YOLO) + audio.     ║
+      # ║  Objetivo: Demucs deja en silencio los chunks sin voz (FP de DFN3)      ║
+      # ║  y preserva la voz real.                                                 ║
+      # ╚══════════════════════════════════════════════════════════════════════════╝
+      import tempfile, soundfile as sf
+      
+      CMP_N_SHOW   = 8
+      CMP_MIN_CONF = 0.10
+
+
+================================================================================
+NOTEBOOK: 04b_class_statistics.ipynb
+================================================================================
+
+TITLE CELL:
+# 02b — Estadísticas descriptivas por clase
+*Caracterización completa de las 9 clases acústicas detectadas.*
+
+Cuatro bloques:
+1. **Confianza por clase** — distribución, media, P25/P75 y diferencia por fuente.
+2. **Duración de evento** — distribución de `t_end−t_start` por clase.
+3. **Tasa de detección** — eventos/min y eventos/km por clase, trayecto y fuente.
+4. **Co-ocurrencia** — qué clases aparecen juntas en ventana ±5 s (matriz y red).
+
+> Las clases fuera de dominio se incluyen descriptivame
+
+FOUND 2 MATCHING CELLS:
+
+[1] cell_id: 6dac918c
+    cell_type: markdown
+    matched_terms: Wiener
+    first_10_lines:
+      ## 6 — Bloque D: Speech ↔ Ring Tone (artefacto del detector)
+      
+      El filtro Wiener induce activaciones en la banda de voz que pueden disparar simultáneamente Speech **y** Ring Tone.
+      Tres métricas para cuantificar este artefacto:
+      
+      1. **IoU temporal** Speech ∩ Ring Tone dentro del mismo trayecto (solapamiento real de intervalos).
+      2. **Asimetría** — ¿Ring Tone cae *dentro* de la ventana de Speech? (Ring Tone contenido en Speech → artefacto).
+      3. **Confianza comparada** — confianza de Ring Tone cuando co-ocurre con Speech vs cuando aparece sola.
+
+[2] cell_id: eb6fc7bd
+    cell_type: code
+    matched_terms: Wiener
+    first_10_lines:
+      SPEECH_ID   = 4
+      RINGTONE_ID = 5
+      
+      ring_rows = []
+      for tr, grp_tr in geo.groupby("trayecto"):
+          speech_sub = grp_tr[grp_tr["class"] == SPEECH_ID]
+          ring_sub   = grp_tr[grp_tr["class"] == RINGTONE_ID]
+          if ring_sub.empty:
+              continue
+          # Speech intervals as numpy arrays (nanoseconds int64)
+
