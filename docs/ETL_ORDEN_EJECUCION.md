@@ -57,11 +57,38 @@ Sin GPU: ~10s por fichero de 5s en CPU. Procesar por fechas con `--date-from/--d
 **Entorno:** cualquier Python
 
 ```powershell
+# Sin post-filtro VAD (default)
 python scripts/infer_clean.py --dual-clean
+
+# Con post-filtro VAD Speech (elimina crispeos residuales Demucs)
+# Requiere .venv311 con silero-vad funcionando (GPU AMD en casa)
+.venv311\Scripts\python.exe scripts/infer_clean.py --dual-clean --vad-speech-filter
 ```
+
+> **Post-filtro VAD Speech (`--vad-speech-filter`):**  
+> Demucs a veces deja crispeos residuales en el stem con suficiente duración/energía para que
+> YOLO prediga Speech cuando no hay voz real. Este flag activa un post-filtro silero-VAD sobre
+> las detecciones Speech del pass 2: para cada detección, extrae la ventana del stem Demucs ya
+> existente (`data/clean_demucs/`) y descarta si `max_prob < threshold` (default 0.4).
+> **No requiere reprocesar audios.** Requiere `silero-vad` en `.venv311`.
+>
+> Validación previa al lote completo (1 día):
+> ```powershell
+> .venv311\Scripts\python.exe scripts/infer_clean.py --dual-clean --vad-speech-filter --date-from 20260420 --date-to 20260420
+> ```
+> Buscar en el log: `[VAD-filter] N → M Speech (K FP residuales descartados, threshold=0.4)`  
+> Si K > 0 y M es razonable → umbral correcto. Ajustar con `--vad-speech-threshold` si hace falta.
+>
+> Tras validar, lanzar el lote completo:
+> ```powershell
+> .venv311\Scripts\python.exe scripts/infer_clean.py --dual-clean --vad-speech-filter
+> ```
+> Luego re-ejecutar Paso 5 (`prepare_mic.py --reprocess-all`) para regenerar `predictions_geo.parquet`.
 
 Pass 1: `data/clean/` → todas las clases excepto Speech (class_id=4)  
 Pass 2: `data/clean_demucs/` → solo Speech (default: `--speech-source demucs`)
+
+Tras procesar todos los archivos se aplica **NMS cross-file** (IoU 0.30, ventana temporal 15s) para eliminar detecciones duplicadas producidas por el solapamiento temporal entre archivos WAV grabados (solapamiento real medido: ~5s entre archivos consecutivos). La ventana de 15s garantiza que solo compiten detecciones temporalmente cercanas, evitando suprimir eventos distintos de la misma clase en momentos alejados del día. Ver [03_inferencia_mic.md §H→J](pipeline/03_inferencia_mic.md).
 
 Para comparar con DFN3 legacy: `python scripts/infer_clean.py --dual-clean --speech-source dfn3`  
 Para re-inferir desde cero: añadir `--reprocess-all` (sobreescribe CSV completo).
@@ -159,6 +186,8 @@ predicciones_clean.csv + predictions_mobile.parquet + data/raw/**/*.gpx
 | `--demucs-model htdemucs_ft` | clean_audio | Modelo Demucs de mayor calidad (mas lento) |
 | `--dual-clean` | infer_clean | Combina Wiener (pass1) + Demucs/DFN3 (pass2 Speech) |
 | `--speech-source demucs\|dfn3` | infer_clean | Fuente pass 2 Speech (default: demucs) |
+| `--vad-speech-filter` | infer_clean | Post-filtro VAD Speech: descarta crispeos residuales Demucs |
+| `--vad-speech-threshold` | infer_clean | Umbral silero-VAD para conservar Speech (default: 0.4) |
 | `--session RUTA` | prepare_mobile | Solo procesa esa sesión |
 | `--skip-join` | prepare_mic | Solo Bloques A+B, sin join GPS |
 | `--no-cross-mic-nms` | prepare_mic | Desactiva NMS cruzado M1/M2 |

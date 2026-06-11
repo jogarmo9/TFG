@@ -82,7 +82,7 @@ La coordenada `xc` en píxeles se convierte a segundos dentro del chunk de 10s.
 conf >= 0.10   AND   x2 > x1
 ```
 
-### H) NMS 1D (Non-Maximum Suppression)
+### H) NMS 1D intra-chunk (Non-Maximum Suppression)
 ```python
 # Greedy, ordenado por confianza descendente, cross-class
 def iou_1d(b1, b2):
@@ -97,6 +97,38 @@ def iou_1d(b1, b2):
 ```python
 onset  = file_start + chunk_i × 10s + x1_sec
 offset = file_start + chunk_i × 10s + x2_sec
+```
+
+### J) NMS cross-file (dedup entre archivos solapados)
+
+Los archivos WAV grabados tienen duración fija de ~10s pero timestamps de inicio separados solo 2–5s entre sí (solapamiento real medido: ~5s). Un evento real queda dentro de la ventana de 2–3 archivos consecutivos y se detecta múltiples veces.
+
+```
+14_21_36 (cubre 14:21:36–14:21:46)  →  detecta evento en 14:21:42 ✓
+14_21_39 (cubre 14:21:39–14:21:49)  →  detecta mismo evento en 14:21:42 ✓ (duplicado)
+14_21_41 (cubre 14:21:41–14:21:51)  →  detecta mismo evento en 14:21:42 ✓ (duplicado)
+```
+
+Tras procesar todos los archivos del directorio, se aplica un segundo NMS sobre timestamps absolutos, agrupado por `(mic_id, class_id)`:
+
+```python
+# Greedy sobre timestamps absolutos (en segundos epoch)
+# Agrupa por (mic_id, class_id) — M1 y M2 son micrófonos distintos, no se suprime entre ellos
+CROSS_IOU_THRESH = 0.3
+
+# Ventana temporal: solo compiten detecciones con |onset_A - onset_B| <= tol_s
+# tol_s=15.0 (default) — cubre el solapamiento real (~5s) con margen x3
+# Evita que dos eventos distintos de la misma clase en momentos alejados
+# del día compitan erróneamente entre sí
+```
+
+Umbral IoU 0.3 (más bajo que el intra-chunk de 0.7) porque el mismo evento visto desde dos archivos distintos puede tener bounds ligeramente diferentes (contexto mel diferente en cada archivo).
+
+La ventana temporal `tol_s=15s` es crítica: sin ella, el NMS greedy compara cada detección contra todas las del día en la misma clase, pudiendo suprimir eventos reales alejados en el tiempo que casualmente tienen IoU alto por duración similar.
+
+El log de ejecución muestra el impacto:
+```
+[NMS cross-file] raw: 312 → 187 | det: 198 → 124
 ```
 
 ---
@@ -216,6 +248,37 @@ python scripts/infer_clean.py --dual-clean --use-candidates
 
 ---
 
+### Post-filtro VAD Speech — crispeos residuales Demucs
+
+El stem vocal de Demucs a veces contiene crispeos residuales (artefactos del modelo de separación) con suficiente duración y energía para que YOLO prediga Speech cuando no hay voz real. El filtro de duración mínima no es suficiente porque estos artefactos pueden durar varios segundos.
+
+**Solución:** post-filtro silero-VAD sobre las detecciones Speech del pass 2, aplicado **después del NMS cross-file**, leyendo los stems ya existentes en `data/clean_demucs/`. No requiere re-ejecutar Demucs.
+
+```powershell
+# Inferencia dual-clean con post-filtro VAD (requiere .venv311 para silero-vad)
+.venv311\Scripts\python.exe scripts/infer_clean.py --dual-clean --vad-speech-filter
+
+# Ajustar umbral (default 0.4 — más alto = más estricto, mayor riesgo de perder voz real)
+.venv311\Scripts\python.exe scripts/infer_clean.py --dual-clean --vad-speech-filter --vad-speech-threshold 0.5
+```
+
+El log muestra el impacto:
+```
+[VAD-filter] 312 → 287 Speech  (25 FP residuales descartados, threshold=0.4)
+```
+
+**Cómo funciona:**
+1. Para cada detección Speech superviviente al NMS cross-file, carga el stem Demucs correspondiente (ya en `data/clean_demucs/`).
+2. Extrae la ventana temporal de la detección del stem.
+3. Corre silero-VAD frame a frame (ventanas de 512 muestras @ 16kHz).
+4. Conserva si `max_prob >= threshold`; descarta si no (crispeo sin voz real).
+
+**Umbral 0.4:** mismo valor calibrado en el prefiltro VAD de candidatos. Coherente con la etapa A. Ajustar si hay falsos descartes (voz muy suave) o FP residuales que persisten.
+
+**Nota:** solo activo con `--speech-source demucs` (default). Con `--speech-source dfn3` se ignora.
+
+---
+
 ### Flags relevantes de `infer_clean.py`
 
 | Flag | Descripción |
@@ -224,6 +287,8 @@ python scripts/infer_clean.py --dual-clean --use-candidates
 | `--cand-dir` | Carpeta de entrada para `--build-candidates` (default: `data/clean_cand`) |
 | `--cand-conf` | Umbral de confianza del prefiltro YOLO (default: 0.06) |
 | `--use-candidates` | En `--dual-clean`: limita el pass 2 a los ficheros en `speech_candidates.txt` |
+| `--vad-speech-filter` | Post-filtro silero-VAD sobre Speech del pass 2 (crispeos residuales Demucs) |
+| `--vad-speech-threshold` | Umbral silero-VAD para conservar detección Speech (default: 0.4) |
 
 ---
 
@@ -269,4 +334,6 @@ mic_id, timestamp_onset, timestamp_offset, class_id, confidence, source_file, se
 | Padding cols | 7 por lado |
 | Padding value | 0.447058824 |
 | Conf. mínima | 0.10 |
-| NMS IoU | 0.70 |
+| NMS IoU intra-chunk | 0.70 |
+| NMS IoU cross-file | 0.30 |
+| NMS ventana temporal cross-file (`tol_s`) | 15 s |

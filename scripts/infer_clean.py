@@ -47,7 +47,8 @@ CHUNK_SEC   = 10            # seconds per inference window
 CHUNK_SAMP  = SR * CHUNK_SEC
 
 CONF_THRESH = 0.1           # minimum confidence to keep a box
-IOU_THRESH  = 0.7           # NMS IoU threshold
+IOU_THRESH       = 0.7      # NMS IoU threshold (intra-chunk)
+CROSS_IOU_THRESH = 0.3      # NMS IoU threshold cross-file (dedup solapamiento grabacion)
 
 # Mel spectrogram parameters (must match training)
 N_FFT       = 2048
@@ -191,19 +192,71 @@ def infer_chunk(session, chunk: np.ndarray, conf_thresh: float) -> list:
 
 
 # ──────────────────────────────────────────────────────────────
+# NMS CROSS-FILE (dedup solapamiento entre archivos grabados)
+# ──────────────────────────────────────────────────────────────
+def _nms_cross_file(detections: list, iou_thresh: float, tol_s: float = 15.0) -> list:
+    """NMS temporal sobre detecciones con timestamps absolutos.
+
+    detections: lista de dicts con keys onset_dt, offset_dt, class_id, confidence, ...
+    Agrupa por (mic_id, class_id) y suprime duplicados por IoU temporal.
+    Solo compiten detecciones cuyo onset dista <= tol_s (evita suprimir eventos
+    del mismo día que no se solapan — solapamiento real entre ficheros es ~5s).
+    Retorna lista de dicts supervivientes.
+    """
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for d in detections:
+        groups[(d["mic_id"], d["class_id"])].append(d)
+
+    result = []
+    for dets in groups.values():
+        dets = sorted(dets, key=lambda d: d["confidence"], reverse=True)
+        kept = []
+        while dets:
+            best = dets[0]
+            kept.append(best)
+            t1_s = best["onset_dt"].timestamp()
+            t1_e = best["offset_dt"].timestamp()
+            remaining = []
+            for d in dets[1:]:
+                t2_s = d["onset_dt"].timestamp()
+                t2_e = d["offset_dt"].timestamp()
+                # Solo suprimir si los onsets están dentro de la ventana de solapamiento
+                if abs(t2_s - t1_s) > tol_s:
+                    remaining.append(d)
+                    continue
+                inter = max(0.0, min(t1_e, t2_e) - max(t1_s, t2_s))
+                union = (t1_e - t1_s) + (t2_e - t2_s) - inter
+                iou = inter / union if union > 0 else 0.0
+                if iou < iou_thresh:
+                    remaining.append(d)
+            dets = remaining
+        result.extend(kept)
+    return result
+
+
+# ──────────────────────────────────────────────────────────────
 # PROCESS ONE FILE
 # ──────────────────────────────────────────────────────────────
-def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_start: datetime,
-                 source_file: str, session_id: str, class_filter=None, conf_thresh: float = CONF_THRESH):
+def process_file(session, wav_path: Path, mic_id: int, file_start: datetime,
+                 source_file: str, session_id: str, class_filter=None,
+                 conf_thresh: float = CONF_THRESH):
     """
-    Chunks the audio, runs inference, and writes rows to both CSV writers.
+    Chunks the audio, runs inference, and returns (raw_rows, det_rows).
+    raw_rows: todas las detecciones antes de NMS intra-chunk.
+    det_rows: detecciones tras NMS intra-chunk (sin NMS cross-file aun).
+    Cada fila es un dict con keys: mic_id, onset_dt, offset_dt, class_id,
+    confidence, source_file, session_id.
     class_filter: set of class_ids to keep, or None for all classes.
-    conf_thresh: umbral de confianza (default CONF_THRESH=0.1; mas bajo para candidatos).
+    conf_thresh: umbral de confianza.
     """
     audio, _ = lb.load(str(wav_path), sr=SR, mono=True)
 
     n_samples = len(audio)
     n_chunks  = max(1, int(np.ceil(n_samples / CHUNK_SAMP)))
+
+    raw_rows = []
+    det_rows = []
 
     for i in range(n_chunks):
         chunk = audio[i * CHUNK_SAMP : (i + 1) * CHUNK_SAMP]
@@ -218,18 +271,45 @@ def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_
         for x1, x2, cls_id, conf in raw_boxes:
             if class_filter is not None and cls_id not in class_filter:
                 continue
-            onset  = file_start + chunk_offset + timedelta(seconds=x1)
-            offset = file_start + chunk_offset + timedelta(seconds=x2)
-            raw_writer.writerow([mic_id, onset.isoformat(), offset.isoformat(),
-                                 float(cls_id), conf, source_file, session_id, "mic"])
+            raw_rows.append({
+                "mic_id":      mic_id,
+                "onset_dt":    file_start + chunk_offset + timedelta(seconds=x1),
+                "offset_dt":   file_start + chunk_offset + timedelta(seconds=x2),
+                "class_id":    float(cls_id),
+                "confidence":  conf,
+                "source_file": source_file,
+                "session_id":  session_id,
+            })
 
         for x1, x2, cls_id, conf in detections:
             if class_filter is not None and cls_id not in class_filter:
                 continue
-            onset  = file_start + chunk_offset + timedelta(seconds=x1)
-            offset = file_start + chunk_offset + timedelta(seconds=x2)
-            writer.writerow([mic_id, onset.isoformat(), offset.isoformat(),
-                             float(cls_id), conf, source_file, session_id, "mic"])
+            det_rows.append({
+                "mic_id":      mic_id,
+                "onset_dt":    file_start + chunk_offset + timedelta(seconds=x1),
+                "offset_dt":   file_start + chunk_offset + timedelta(seconds=x2),
+                "class_id":    float(cls_id),
+                "confidence":  conf,
+                "source_file": source_file,
+                "session_id":  session_id,
+            })
+
+    return raw_rows, det_rows
+
+
+def _write_rows(writer, rows: list):
+    """Escribe lista de dicts de deteccion al CSV writer."""
+    for d in rows:
+        writer.writerow([
+            d["mic_id"],
+            d["onset_dt"].isoformat(),
+            d["offset_dt"].isoformat(),
+            d["class_id"],
+            d["confidence"],
+            d["source_file"],
+            d["session_id"],
+            "mic",
+        ])
 
 
 # ──────────────────────────────────────────────────────────────
@@ -247,16 +327,101 @@ def _in_date_range(name: str, date_from: str, date_to: str) -> bool:
     return True
 
 
+# ──────────────────────────────────────────────────────────────
+# VAD POST-FILTRO Speech (crispeos residuales Demucs)
+# ──────────────────────────────────────────────────────────────
+def _vad_filter_speech(det_rows: list, speech_dir: Path,
+                       threshold: float = 0.4, sr: int = SR,
+                       window: int = 512) -> list:
+    """Post-filtro silero-VAD sobre detecciones Speech del pass 2 (stem Demucs).
+
+    Para cada detección Speech, carga el stem ya existente en speech_dir,
+    extrae la ventana temporal de la detección y comprueba si silero detecta voz.
+    Descarta si max_prob < threshold (crispeo residual sin voz real).
+
+    No requiere reprocesar audios: lee data/clean_demucs/ ya existente.
+    Requiere silero-vad instalado (.venv311): pip install silero-vad
+    """
+    try:
+        import torch
+        from silero_vad import load_silero_vad
+    except (ImportError, OSError) as _e:
+        print(f"  [VAD-filter] silero-vad no disponible ({type(_e).__name__}) — filtro desactivado.\n"
+              "               Instalar con: pip install silero-vad  (requiere .venv311)")
+        return det_rows
+
+    model = load_silero_vad()
+    model.eval()
+
+    audio_cache: dict = {}
+    kept = []
+    discarded = 0
+
+    for d in det_rows:
+        fname = d["source_file"]
+
+        # Cache audio del stem por fichero
+        if fname not in audio_cache:
+            wav_path = speech_dir / fname
+            if wav_path.exists():
+                audio_cache[fname], _ = lb.load(str(wav_path), sr=sr, mono=True)
+            else:
+                audio_cache[fname] = None
+
+        audio = audio_cache[fname]
+        if audio is None:
+            kept.append(d)
+            continue
+
+        # Offset dentro del fichero a partir del nombre (parse_filename retorna datetime naive)
+        try:
+            _, file_start = parse_filename(fname)
+        except ValueError:
+            kept.append(d)
+            continue
+
+        onset_s  = (d["onset_dt"]  - file_start).total_seconds()
+        offset_s = (d["offset_dt"] - file_start).total_seconds()
+        i1 = max(0, int(onset_s  * sr))
+        i2 = min(len(audio), int(offset_s * sr))
+        segment = audio[i1:i2]
+
+        if len(segment) < window:
+            segment = np.pad(segment, (0, window - len(segment)))
+
+        model.reset_states()
+        probs = []
+        for i in range(0, len(segment) - window + 1, window):
+            chunk = torch.from_numpy(segment[i:i + window]).float()
+            probs.append(model(chunk, sr).item())
+
+        if not probs or max(probs) >= threshold:
+            kept.append(d)
+        else:
+            discarded += 1
+
+    tag = f"threshold={threshold}"
+    if discarded:
+        print(f"  [VAD-filter] {len(det_rows)} → {len(kept)} Speech  "
+              f"({discarded} FP residuales descartados, {tag})")
+    else:
+        print(f"  [VAD-filter] 0 FP residuales detectados  ({len(kept)} detecciones, {tag})")
+
+    return kept
+
+
 def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
              class_filter=None, already_done: set = None,
              conf_thresh: float = CONF_THRESH, only_files: set = None,
-             date_from: str = None, date_to: str = None) -> tuple[int, int]:
-    """Procesa todos los WAVs en wav_dir, escribe a ambos writers. Retorna (ok, fail).
+             date_from: str = None, date_to: str = None,
+             vad_filter_fn=None) -> tuple[int, int]:
+    """Procesa todos los WAVs en wav_dir, aplica NMS cross-file y escribe writers. Retorna (ok, fail).
 
-    conf_thresh: umbral de confianza propagado a process_file.
-    only_files:  si se pasa, procesa solo los WAVs cuyo nombre este en este set
-                 (subconjunto de candidatos Speech).
+    conf_thresh:    umbral de confianza propagado a process_file.
+    only_files:     si se pasa, procesa solo los WAVs cuyo nombre este en este set.
     date_from/date_to: filtro YYYYMMDD inclusive por fecha en el nombre.
+    vad_filter_fn:  callable opcional aplicado a det_dedup tras NMS cross-file.
+                    Uso: post-filtro VAD Speech (pass 2 Demucs).
     """
     wav_files = sorted(wav_dir.glob("*.wav"))
     if only_files is not None:
@@ -267,6 +432,8 @@ def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
         print(f"  [WARN] No se encontraron .wav en {wav_dir}")
         return 0, 0
 
+    all_raw = []
+    all_det = []
     ok = fail = 0
     for wav_path in wav_files:
         filename = wav_path.name
@@ -281,15 +448,30 @@ def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
             continue
         try:
             session_id = f"{file_start.year}{file_start.month:02d}{file_start.day:02d}"
-            process_file(infer_session, wav_path, writer, raw_writer,
-                         mic_id, file_start, filename, session_id,
-                         class_filter=class_filter, conf_thresh=conf_thresh)
+            raw_rows, det_rows = process_file(
+                infer_session, wav_path, mic_id, file_start, filename, session_id,
+                class_filter=class_filter, conf_thresh=conf_thresh)
+            all_raw.extend(raw_rows)
+            all_det.extend(det_rows)
             label = "" if class_filter is None else f" (clases {sorted(class_filter)})"
             print(f"  [OK] {filename}{label}")
             ok += 1
         except Exception as e:
             print(f"  [ERROR] {filename} – {e}")
             fail += 1
+
+    # NMS cross-file: elimina duplicados por solapamiento entre archivos grabados
+    raw_dedup = _nms_cross_file(all_raw, CROSS_IOU_THRESH)
+    det_dedup = _nms_cross_file(all_det, CROSS_IOU_THRESH)
+    print(f"  [NMS cross-file] raw: {len(all_raw)} → {len(raw_dedup)} | "
+          f"det: {len(all_det)} → {len(det_dedup)}")
+
+    # Post-filtro opcional (p.ej. VAD Speech para crispeos residuales Demucs)
+    if vad_filter_fn is not None:
+        det_dedup = vad_filter_fn(det_dedup)
+
+    _write_rows(raw_writer, raw_dedup)
+    _write_rows(writer, det_dedup)
     return ok, fail
 
 
@@ -367,6 +549,13 @@ def main():
                         help="Procesar solo ficheros desde esta fecha (YYYYMMDD, inclusive).")
     parser.add_argument("--date-to", default=None,
                         help="Procesar solo ficheros hasta esta fecha (YYYYMMDD, inclusive).")
+    parser.add_argument("--vad-speech-filter", action="store_true",
+                        help="En --dual-clean: aplica post-filtro silero-VAD sobre detecciones "
+                             "Speech del pass 2 para descartar crispeos residuales del stem Demucs. "
+                             "No requiere reprocesar audios. Requiere silero-vad (.venv311).")
+    parser.add_argument("--vad-speech-threshold", type=float, default=0.4,
+                        help="Umbral silero-VAD para conservar una deteccion Speech (default: 0.4). "
+                             "Solo activo con --vad-speech-filter.")
     args = parser.parse_args()
 
     if not MODEL_PATH.exists():
@@ -418,7 +607,18 @@ def main():
             print(f"[INFO] use-candidates: pass 2 limitado a {len(only_files)} ficheros "
                   f"de {CANDIDATES_FILE.name}")
 
-        print(f"[INFO] Modo DUAL-CLEAN: Wiener→clases≠Speech | {speech_tag}→Speech")
+        # Post-filtro VAD para crispeos residuales Demucs (opcional, pass 2 únicamente)
+        vad_fn = None
+        if args.vad_speech_filter:
+            if args.speech_source != "demucs":
+                print("[WARN] --vad-speech-filter solo tiene efecto con --speech-source demucs. Ignorado.")
+            else:
+                _thr = args.vad_speech_threshold
+                _sdir = speech_dir
+                vad_fn = lambda dets: _vad_filter_speech(dets, _sdir, threshold=_thr)
+                print(f"[INFO] VAD post-filtro Speech ACTIVADO (threshold={_thr})")
+
+        print(f"[INFO] Modo DUAL-CLEAN: Wiener->clases!=Speech | {speech_tag}->Speech")
         print(f"[INFO] Salida CSV: {OUTPUT_CSV} (modo: sobreescribir)")
         with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as fcsv, \
              open(OUTPUT_CSV_RAW, "w", newline="", encoding="utf-8") as fcsv_raw:
@@ -427,7 +627,7 @@ def main():
             writer.writerow(header)
             raw_writer.writerow(header)
 
-            print(f"\n[PASS 1] Wiener ({CLEAN_DIR.name}/) → clases≠Speech")
+            print(f"\n[PASS 1] Wiener ({CLEAN_DIR.name}/) -> clases!=Speech")
             ok1, fail1 = _run_dir(infer_session, CLEAN_DIR, writer, raw_writer,
                                   class_filter=ALL_CLASSES - {SPEECH_ID},
                                   date_from=args.date_from, date_to=args.date_to)
@@ -435,7 +635,8 @@ def main():
             print(f"\n[PASS 2] {speech_tag} ({speech_dir.name}/) → Speech únicamente")
             ok2, fail2 = _run_dir(infer_session, speech_dir, writer, raw_writer,
                                   class_filter={SPEECH_ID}, only_files=only_files,
-                                  date_from=args.date_from, date_to=args.date_to)
+                                  date_from=args.date_from, date_to=args.date_to,
+                                  vad_filter_fn=vad_fn)
 
         print(f"\n{'='*50}")
         print(f"Procesados OK : {ok1 + ok2}  (Wiener: {ok1} | {speech_tag}: {ok2})")
