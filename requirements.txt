@@ -18,3 +18,4 @@ demucs==4.0.1
 noisereduce
 torch==2.0.1
 torchaudio==2.0.2
+resampy

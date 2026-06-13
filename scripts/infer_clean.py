@@ -24,6 +24,9 @@ import numpy as np
 import librosa as lb
 import onnxruntime as ort
 
+# Import Silero VAD validator
+from silero_vad_validator import SileroVADValidator
+
 # ──────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────────────────────
@@ -194,22 +197,31 @@ def infer_chunk(session, chunk: np.ndarray, conf_thresh: float) -> list:
 # PROCESS ONE FILE
 # ──────────────────────────────────────────────────────────────
 def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_start: datetime,
-                 source_file: str, session_id: str, class_filter=None, conf_thresh: float = CONF_THRESH):
+                 source_file: str, session_id: str, class_filter=None, conf_thresh: float = CONF_THRESH,
+                 vad_validator=None, chunk_audio_data=None):
     """
     Chunks the audio, runs inference, and writes rows to both CSV writers.
     class_filter: set of class_ids to keep, or None for all classes.
     conf_thresh: umbral de confianza (default CONF_THRESH=0.1; mas bajo para candidatos).
+    vad_validator: optional SileroVADValidator for validating Speech predictions
+    chunk_audio_data: optional dict to return audio chunks for external validation
     """
     audio, _ = lb.load(str(wav_path), sr=SR, mono=True)
 
     n_samples = len(audio)
     n_chunks  = max(1, int(np.ceil(n_samples / CHUNK_SAMP)))
+    
+    # Store audio chunks for VAD validation if needed
+    audio_chunks_by_idx = {}
 
     for i in range(n_chunks):
         chunk = audio[i * CHUNK_SAMP : (i + 1) * CHUNK_SAMP]
 
         if len(chunk) < CHUNK_SAMP:
             chunk = np.pad(chunk, (0, CHUNK_SAMP - len(chunk)))
+        
+        # Store for VAD validation if needed
+        audio_chunks_by_idx[i] = chunk
 
         chunk_offset = timedelta(seconds=i * CHUNK_SEC)
         raw_boxes    = infer_chunk(session, chunk, conf_thresh)
@@ -218,6 +230,23 @@ def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_
         for x1, x2, cls_id, conf in raw_boxes:
             if class_filter is not None and cls_id not in class_filter:
                 continue
+            
+            # VAD validation for Speech predictions
+            should_write = True
+            if vad_validator is not None and cls_id == SPEECH_ID:
+                # Extract the relevant part of the audio chunk
+                start_sample = int(x1 * SR)
+                end_sample = int(x2 * SR)
+                audio_segment = chunk[start_sample:end_sample]
+                
+                if len(audio_segment) > 0:
+                    should_write, vad_prob = vad_validator.validate_segment(audio_segment, yolo_confidence=conf)
+                else:
+                    should_write = False
+            
+            if not should_write:
+                continue
+                
             onset  = file_start + chunk_offset + timedelta(seconds=x1)
             offset = file_start + chunk_offset + timedelta(seconds=x2)
             raw_writer.writerow([mic_id, onset.isoformat(), offset.isoformat(),
@@ -226,6 +255,23 @@ def process_file(session, wav_path: Path, writer, raw_writer, mic_id: int, file_
         for x1, x2, cls_id, conf in detections:
             if class_filter is not None and cls_id not in class_filter:
                 continue
+            
+            # VAD validation for Speech predictions
+            should_write = True
+            if vad_validator is not None and cls_id == SPEECH_ID:
+                # Extract the relevant part of the audio chunk
+                start_sample = int(x1 * SR)
+                end_sample = int(x2 * SR)
+                audio_segment = chunk[start_sample:end_sample]
+                
+                if len(audio_segment) > 0:
+                    should_write, vad_prob = vad_validator.validate_segment(audio_segment, yolo_confidence=conf)
+                else:
+                    should_write = False
+            
+            if not should_write:
+                continue
+                
             onset  = file_start + chunk_offset + timedelta(seconds=x1)
             offset = file_start + chunk_offset + timedelta(seconds=x2)
             writer.writerow([mic_id, onset.isoformat(), offset.isoformat(),
@@ -250,13 +296,14 @@ def _in_date_range(name: str, date_from: str, date_to: str) -> bool:
 def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
              class_filter=None, already_done: set = None,
              conf_thresh: float = CONF_THRESH, only_files: set = None,
-             date_from: str = None, date_to: str = None) -> tuple[int, int]:
+             date_from: str = None, date_to: str = None, vad_validator=None) -> tuple[int, int]:
     """Procesa todos los WAVs en wav_dir, escribe a ambos writers. Retorna (ok, fail).
 
     conf_thresh: umbral de confianza propagado a process_file.
     only_files:  si se pasa, procesa solo los WAVs cuyo nombre este en este set
                  (subconjunto de candidatos Speech).
     date_from/date_to: filtro YYYYMMDD inclusive por fecha en el nombre.
+    vad_validator: optional SileroVADValidator for validating Speech predictions
     """
     wav_files = sorted(wav_dir.glob("*.wav"))
     if only_files is not None:
@@ -283,7 +330,7 @@ def _run_dir(infer_session, wav_dir: Path, writer, raw_writer,
             session_id = f"{file_start.year}{file_start.month:02d}{file_start.day:02d}"
             process_file(infer_session, wav_path, writer, raw_writer,
                          mic_id, file_start, filename, session_id,
-                         class_filter=class_filter, conf_thresh=conf_thresh)
+                         class_filter=class_filter, conf_thresh=conf_thresh, vad_validator=vad_validator)
             label = "" if class_filter is None else f" (clases {sorted(class_filter)})"
             print(f"  [OK] {filename}{label}")
             ok += 1
@@ -433,9 +480,19 @@ def main():
                                   date_from=args.date_from, date_to=args.date_to)
 
             print(f"\n[PASS 2] {speech_tag} ({speech_dir.name}/) → Speech únicamente")
+            
+            # Initialize Silero VAD validator for Speech predictions
+            print(f"[PASS 2] Inicializando validador Silero VAD...")
+            try:
+                vad_validator = SileroVADValidator()
+            except Exception as e:
+                print(f"[WARN] No se pudo cargar Silero VAD: {e}")
+                print(f"[WARN] Continuando sin validación VAD (todos los Speech se guardarán)")
+                vad_validator = None
+            
             ok2, fail2 = _run_dir(infer_session, speech_dir, writer, raw_writer,
                                   class_filter={SPEECH_ID}, only_files=only_files,
-                                  date_from=args.date_from, date_to=args.date_to)
+                                  date_from=args.date_from, date_to=args.date_to, vad_validator=vad_validator)
 
         print(f"\n{'='*50}")
         print(f"Procesados OK : {ok1 + ok2}  (Wiener: {ok1} | {speech_tag}: {ok2})")
