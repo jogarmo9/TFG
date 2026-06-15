@@ -113,7 +113,7 @@ Demucs es lento (~10 s/fichero en CPU). Con el prefiltro se reduce el lote a los
 
 ```bash
 # Paso 0: generar data/clean_cand/ (Wiener sin HPSS, rápido, solo una vez)
-python scripts/clean_audio.py --method wiener --impulse-removal ^
+python scripts/clean_audio.py --method wiener 
   --clean-dir data/clean_cand --reprocess-all
 
 # Paso 1A: puntuar con silero-vad (pesado, una vez)

@@ -191,6 +191,5 @@ def load_tracks(path="data/processed/tracks.parquet") -> pd.DataFrame:
 
 # Trayectos a excluir (GPS defectuoso / sin audio) — ver TFG_CONTEXT §12.
 BAD_TRAYECTOS = {
-    "MASANASA-SILLA_2_Revisar_GPS",
     "11-03-2026_skip1", "11-03-2026_skip2",
 }

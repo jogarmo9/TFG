@@ -24,9 +24,6 @@ import numpy as np
 import librosa as lb
 import onnxruntime as ort
 
-# Import Silero VAD validator
-from silero_vad_validator import SileroVADValidator
-
 # ──────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────────────────────
@@ -151,13 +148,14 @@ def _iou_1d(b1, b2):
 
 
 def nms(boxes: list, iou_thresh: float) -> list:
-    """Greedy NMS. boxes = list of [x1, x2, cls, conf]."""
+    """Greedy NMS per class. boxes = list of [x1, x2, cls, conf]."""
     boxes = sorted(boxes, key=lambda b: b[3], reverse=True)
     result = []
     while boxes:
         best = boxes[0]
         result.append(best)
-        boxes = [b for b in boxes[1:] if _iou_1d(best, b) < iou_thresh]
+        boxes = [b for b in boxes[1:]
+                 if b[2] != best[2] or _iou_1d(best, b) < iou_thresh]
     return result
 
 
@@ -257,9 +255,6 @@ def process_file(session, wav_path: Path, mic_id: int, file_start: datetime,
 
     n_samples = len(audio)
     n_chunks  = max(1, int(np.ceil(n_samples / CHUNK_SAMP)))
-    
-    # Store audio chunks for VAD validation if needed
-    audio_chunks_by_idx = {}
 
     raw_rows = []
     det_rows = []
@@ -269,9 +264,6 @@ def process_file(session, wav_path: Path, mic_id: int, file_start: datetime,
 
         if len(chunk) < CHUNK_SAMP:
             chunk = np.pad(chunk, (0, CHUNK_SAMP - len(chunk)))
-        
-        # Store for VAD validation if needed
-        audio_chunks_by_idx[i] = chunk
 
         chunk_offset = timedelta(seconds=i * CHUNK_SEC)
         raw_boxes    = infer_chunk(session, chunk, conf_thresh)
