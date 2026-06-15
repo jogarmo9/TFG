@@ -24,6 +24,9 @@ import numpy as np
 import librosa as lb
 import onnxruntime as ort
 
+# Import Silero VAD validator
+from silero_vad_validator import SileroVADValidator
+
 # ──────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────────────────────
@@ -254,6 +257,9 @@ def process_file(session, wav_path: Path, mic_id: int, file_start: datetime,
 
     n_samples = len(audio)
     n_chunks  = max(1, int(np.ceil(n_samples / CHUNK_SAMP)))
+    
+    # Store audio chunks for VAD validation if needed
+    audio_chunks_by_idx = {}
 
     raw_rows = []
     det_rows = []
@@ -263,6 +269,9 @@ def process_file(session, wav_path: Path, mic_id: int, file_start: datetime,
 
         if len(chunk) < CHUNK_SAMP:
             chunk = np.pad(chunk, (0, CHUNK_SAMP - len(chunk)))
+        
+        # Store for VAD validation if needed
+        audio_chunks_by_idx[i] = chunk
 
         chunk_offset = timedelta(seconds=i * CHUNK_SEC)
         raw_boxes    = infer_chunk(session, chunk, conf_thresh)
