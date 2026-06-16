@@ -18,13 +18,17 @@ TFG/
 │   ├── clean_dfn/       WAVs limpios DFN3-75 (Speech — legacy)
 │   ├── mobile/          Sesiones smartphone (audio + meta.json + track.gpx)
 │   └── processed/       Outputs del ETL
-│       ├── predicciones_clean.csv      inferencia mic (CSV raw)
+│       ├── predicciones_clean.csv          inferencia mic (CSV raw)
+│       ├── predicciones_clean_raw.csv      inferencia mic sin filtrar
 │       ├── predictions_mic.parquet
+│       ├── predictions_mic_raw.parquet
 │       ├── tracks_mic.parquet
 │       ├── predictions_mobile.parquet
+│       ├── predictions_mobile_raw.parquet
+│       ├── predictions_mobile_noWiener.parquet
 │       ├── tracks_mobile.parquet
-│       ├── predictions_geo.parquet     ← DATASET PRINCIPAL (lat/lon)
-│       ├── predictions_filtered.parquet  conf ≥ 0.80
+│       ├── predictions_geo.parquet         ← DATASET PRINCIPAL (lat/lon)
+│       ├── predictions_filtered.parquet    conf ≥ 0.80
 │       ├── danger_scores.parquet
 │       └── tracks.parquet
 │
@@ -32,22 +36,28 @@ TFG/
 │   └── YOLOv5n_original.onnx
 │
 ├── scripts/
-│   ├── clean_audio.py        preprocesado Wiener/DFN3
+│   ├── clean_audio.py        preprocesado Wiener/DFN3/Demucs
 │   ├── infer_clean.py        inferencia YOLO → predicciones_clean.csv
 │   ├── prepare_mobile.py     pipeline móvil completo
 │   ├── prepare_mic.py        ETL mic + join GPS
 │   ├── gen_meta.py           genera meta.json desde GPX
+│   ├── export_maps.py        exporta mapas HTML a disco
+│   ├── preview_maps.py       previsualización rápida de mapas
+│   ├── vad_candidates.py     candidatos VAD para validación Speech
 │   └── geo_utils.py          helpers compartidos (velocidad, Wilson CI, grilla)
 │
 ├── notebooks/
-│   ├── 00_raw_vs_clean_comparison.ipynb  impacto filtro Wiener
-│   ├── 01_etl.ipynb                      validación ETL
-│   ├── 02_reliability_and_classes.ipynb  fiabilidad + triaje de dominio
-│   ├── 02b_class_statistics.ipynb        estadísticas descriptivas por clase
-│   ├── 03_acoustic_mobility.ipynb        acústica × movilidad GPS
-│   ├── 04_danger_maps.ipynb              mapas de peligro
-│   ├── 04_mobile_preprocess_eval.ipynb   validación preprocesado mobile
-│   └── 05_dfn3_speech_tuning.ipynb       tuning DFN3 + comparativa Wiener
+│   ├── 00_mobile_preprocess_eval.ipynb   validación preprocesado mobile
+│   ├── 01_dfn3_speech_tuning.ipynb       tuning DFN3 + comparativa Wiener
+│   ├── 02_raw_vs_clean_comparison.ipynb  impacto filtro Wiener
+│   ├── 03_etl.ipynb                      validación ETL + distribución trayectos
+│   ├── 04_reliability_and_classes.ipynb  fiabilidad + triaje de dominio
+│   ├── 04b_class_statistics.ipynb        estadísticas descriptivas por clase
+│   ├── 05_acoustic_mobility.ipynb        acústica × movilidad GPS
+│   ├── 06_maps.ipynb                     mapas de peligro acústico
+│   ├── 07_validation_listen.ipynb        validación auditiva de predicciones
+│   ├── 08_spectrograms.ipynb             espectrogramas antes/después preprocesado
+│   └── interactive_map_zoom.ipynb        mapa interactivo con zoom
 │
 ├── docs/
 │   ├── TFG_CONTEXT.md        documento maestro del TFG
@@ -61,7 +71,8 @@ TFG/
 │       └── 06_analisis_resultados.md
 │
 ├── outputs/                  figuras y mapas HTML generados por notebooks
-├── validation/               hoja de etiquetado manual (is_tp) para NB-02
+├── figs/                     figuras para el LaTeX
+├── validation/               hoja de etiquetado manual (is_tp) para NB-04
 └── requirements.txt
 ```
 
@@ -97,7 +108,7 @@ python scripts/prepare_mobile.py
 # Paso 5 — ETL mic + join GPS → predictions_geo.parquet
 python scripts/prepare_mic.py --reprocess-all
 
-# → Abrir notebooks en orden: 00 → 01 → 02 → 02b → 03 → 04
+# → Abrir notebooks en orden: 03 → 04 → 04b → 05 → 06
 ```
 
 ---
